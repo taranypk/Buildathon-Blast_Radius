@@ -253,7 +253,7 @@ def main():
         lo = p.est + pack_cost(p.blind, ms)
         hi = p.est * 0.6 + pack_cost(p.blind | run | slow_if_fail, ms)
         cost_check = (1 - P_FAIL) * lo + P_FAIL * hi
-        if not run or cost_blind <= cost_check:
+        if not run:  # PROBE: always check
             out[cid] = pack(cands, ms)
             log(cid, f"blind cands={len(cands)} blind_cost={cost_blind:.1f} check_cost={cost_check:.1f}")
             continue
@@ -289,6 +289,7 @@ def main():
         return final
 
     def should_stop(cid, failed, passed):
+        return False  # PROBE: never stop early
         p = plans[cid]
         seen = {by_id[n] for n in failed | passed if n in by_id}
         remaining = [c for c in p.run if c not in seen]
