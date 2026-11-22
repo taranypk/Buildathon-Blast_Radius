@@ -26,7 +26,7 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 WORKER_MS = 2000
 PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor test
-E_SAMPLE = 10  # TPC-DS queries to run when a change can reach many of them
+E_SAMPLE = int(os.environ.get("BR_E_SAMPLE", "10"))  # TPC-DS queries to run when a change can reach many of them
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.1"))  # our CPU seconds per recorded test second
@@ -167,6 +167,17 @@ def main():
     budget = max(40.0, 3.6 * n_commits)  # the scorer allows ~4.5 s of wall time per commit
     twin = {by_id[k]: by_id[v] for k, v in PROXY_BY.items() if k in by_id and v in by_id}
     proxy_cost = {by_id[k]: v for k, v in PROXY_COST.items() if k in by_id}
+    # CPU seconds each test takes in our runner (in-process pools, no pytest), measured
+    # on the base commit; the recorded wall seconds are the fallback
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_s.json")) as f:
+            cpu_s = {by_id[k]: v for k, v in json.load(f).items() if k in by_id}
+    except Exception:  # noqa: BLE001
+        cpu_s = {}
+
+    def run_s(n):
+        v = cpu_s.get(n)
+        return ms[n] / 1000 if v is None else max(v, 0.002)
 
     subq_tests = {by_id[k] for k in m.subq if k in by_id}
     casemap_box = {}
@@ -197,9 +208,9 @@ def main():
         if p is not None and by_num[n] in p.keep:
             k = p.keep[by_num[n]]
             if isinstance(k, dict):
-                return 0.05 + ms[n] / 1000 * k["frac"]
+                return 0.05 + run_s(n) * k["frac"]
             return 1.4 + 0.5 * len(k)
-        return proxy_cost.get(n, ms[n] / 1000)
+        return proxy_cost.get(n, run_s(n))
 
     def cls_of(n):
         return by_num[n].rsplit("::", 1)[0]

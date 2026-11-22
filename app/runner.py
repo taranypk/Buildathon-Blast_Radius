@@ -72,19 +72,47 @@ class SyncExecutor:
         self._inited = False
 
     def submit(self, fn, *args, **kwargs):
+        """Returns an already-'finished' future whose work runs when its result is first
+        asked for, so a test that stops at its first failing subTest skips the rest."""
         import concurrent.futures as cf
         import pickle
 
-        f = cf.Future()
+        ex = self
+
+        class _Lazy(cf.Future):
+            _computed = False
+
+            def _compute(self):
+                if self._computed:
+                    return
+                self._computed = True
+                try:
+                    if not ex._inited:
+                        ex._inited = True
+                        if ex._init[0] is not None:
+                            ex._init[0](*pickle.loads(pickle.dumps(ex._init[1])))
+                    a, k = self._payload
+                    self._result = pickle.loads(pickle.dumps(fn(*a, **k)))
+                except BaseException as e:  # noqa: BLE001
+                    self._exception = e
+
+            def result(self, timeout=None):
+                self._compute()
+                if self._exception is not None:
+                    raise self._exception
+                return self._result
+
+            def exception(self, timeout=None):
+                self._compute()
+                return self._exception
+
+        f = _Lazy()
         try:
-            if not self._inited:
-                self._inited = True
-                if self._init[0] is not None:
-                    self._init[0](*pickle.loads(pickle.dumps(self._init[1])))
-            a, k = pickle.loads(pickle.dumps((args, kwargs)))
-            f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+            f._payload = pickle.loads(pickle.dumps((args, kwargs)))
         except BaseException as e:  # noqa: BLE001
-            f.set_exception(e)
+            f._computed = True
+            f._exception = e
+        f._state = "FINISHED"
         return f
 
     def map(self, fn, *its, **kw):
@@ -289,6 +317,12 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None, import_check=F
             def __init__(self):
                 super().__init__()
                 self.bad = set()
+                # a test stops at its first failing subTest (we only need pass/fail);
+                # the run itself carries on
+                self.failfast = True
+
+            def stop(self):
+                pass
 
             def _mark(self, test):
                 nid = id_of.get(id(test))
