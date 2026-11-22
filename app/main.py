@@ -366,6 +366,10 @@ def main():
                 # sample can pass while one of the reached queries fails. Either every query
                 # the change reaches runs, or the optimizer twin decides, or the test is
                 # scheduled unchecked.
+                if os.environ.get("BR_E_SAMPLING") and (keep is None or len(keep) > E_SAMPLE) and m.e_cover:
+                    pool = [q for q in m.e_cover if keep is None or q in keep]
+                    rest = [q for q in m.e_cover if q not in pool]
+                    keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
                 if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
                     keep = None  # the optimizer twin is the cheaper check

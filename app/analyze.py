@@ -45,6 +45,29 @@ def imports_name(m, f, name, src_root=None):
     return name in cache[f]
 
 
+def _code_only(parts):
+    """Lower-cased Python code of the given source fragments without comments and string
+    literals (so a comment or SQL text mentioning dialects does not count), tokens joined
+    by single spaces; None if a fragment does not tokenize."""
+    import io
+    import textwrap
+    import tokenize
+
+    out = []
+    skip = {tokenize.COMMENT, tokenize.STRING, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}
+    for extra in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
+        if hasattr(tokenize, extra):
+            skip.add(getattr(tokenize, extra))
+    for part in parts:
+        try:
+            for t in tokenize.generate_tokens(io.StringIO(textwrap.dedent(part) + "\n").readline):
+                if t.type not in skip and t.string:
+                    out.append(t.string)
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return None
+    return " ".join(out).lower().replace(" . ", ".").replace(" .", ".").replace(". ", ".")
+
+
 class Map:
     def __init__(self, data):
         self.lines = {f: {int(l): set(s) for l, s in d.items()} for f, d in data["lines"].items()}
@@ -204,7 +227,8 @@ class Map:
         (ms, me), other = rng
         parts = ["\n".join(lines[ms - 1 : me])] + ["\n".join(lines[a - 1 : b]) for a, b in other]
         text = "\n".join(parts).lower()
-        if "dialects" in text or ".classes" in text or "for name in" in text:
+        code = _code_only(parts)
+        if code is None or "dialects" in code or ".classes" in code or "for name in" in code:
             self._ttext[n] = None  # iterates over every dialect / mapping: keep it
             return None
         self._ttext[n] = (text, tuple(self._opened().get(n, ())))
@@ -579,6 +603,30 @@ def exp_keys(node, line, lines_):
     return set(keys)
 
 
+def pygen_effect(m, path, code_text, covered):
+    """A change inside code of the Python executor's generator (sqlglot/generators/python.py)
+    only alters the generated code it emits. That code runs only for rows that reach it, so
+    the TPC-DS queries that matter are the ones whose runs called the ENV functions the code
+    emits, not every query that generated it. Returns the narrowed set, or None."""
+    import re
+
+    if path != "sqlglot/generators/python.py" or not m.env_usage:
+        return None
+    qmap = m.env_usage.get("queries", {})
+    tmap = m.env_usage.get("tests", {})
+    names = {n for n in re.findall(r"\b([A-Z][A-Z0-9_]*)\(", code_text) if n in qmap or n in tmap}
+    if not names:
+        return None
+    pseudo = sorted(c for c in covered if c >= 100000)
+    out = {c for c in covered if c < 100000}
+    for n in names:
+        out |= {100000 + q for q in qmap.get(n, ())}
+        out |= set(tmap.get(n, ()))
+    # a generation-time error fails every query that generates the code: two of them
+    out |= set(pseudo[:2])
+    return out
+
+
 def env_entry_effect(m, path, node, line, old_lines, new_lines, added=False):
     """Tests and TPC-DS queries (pseudo-tests) calling the ENV function on a changed entry
     line of sqlglot/executor/env.py's ENV table; None when the rule does not apply."""
@@ -896,7 +944,13 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 # inside a lambda body (a table entry's code): it runs only when called,
                 # so the tests that ran those lines are exactly the ones affected
                 lines_l = set(range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
-                res.add(m.tests_on(path, lines_l), where=(path, lines_l))
+                cov = m.tests_on(path, lines_l)
+                lam_text = "\n".join(old_lines[lam.lineno - 1 : (lam.end_lineno or lam.lineno)] + new_lines[lam.lineno - 1 : (lam.end_lineno or lam.lineno)])
+                narrowed = pygen_effect(m, path, lam_text, cov)
+                if narrowed is not None:
+                    res.notes.append(f"pygen {len(cov)}->{len(narrowed)}")
+                    cov = narrowed
+                res.add(cov, where=(path, lines_l))
                 res.notes.append(f"lambda-body {path}:{line}")
                 continue
             in_func = any(isinstance(c, FUNC) for c in chain[1:])
@@ -930,6 +984,15 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 direct_lines = set(range(lo, hi + 1))
             esc = escape_keys(node, line, old_lines, new_lines) if not in_func and sql_keyed(m, path, chain) else None
             direct = m.tests_on(path, direct_lines)
+            if in_func and path == "sqlglot/generators/python.py":
+                fn = next((c for c in reversed(chain) if isinstance(c, FUNC)), None)
+                if fn is not None:
+                    a, b = fn.lineno, (fn.end_lineno or fn.lineno)
+                    fn_text = "\n".join(old_lines[a - 1 : b]) + "\n" + "\n".join(new_lines[a - 1 : b + 2])
+                    narrowed = pygen_effect(m, path, fn_text, direct)
+                    if narrowed is not None:
+                        res.notes.append(f"pygen {len(direct)}->{len(narrowed)}")
+                        direct = narrowed
             if esc and m.id_of:
                 kept = m.key_filter(src_root, direct, esc)
                 res.notes.append(f"escape-filter {sorted(esc)[:3]} {len(direct)}->{len(kept)}")
