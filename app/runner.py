@@ -496,9 +496,11 @@ def run_jobs(specs, src_root, tmp_root, parallel=2, on_done=None, should_stop=No
         ready, _, _ = select.select([j.fd for j in running], [], [], wait)
         for j in list(running):
             if j.fd in ready:
-                n_before = len(j.failed)
+                n_before, p_before = len(j.failed), len(j.passed)
                 j.feed()
-                if should_stop and len(j.failed) > n_before and not j.closed and not j.done:
+                # reconsider after a new failure, and after further passes once something failed
+                changed = len(j.failed) > n_before or (j.failed and len(j.passed) > p_before)
+                if should_stop and changed and not j.closed and not j.done:
                     if should_stop(j.key, j.failed, j.passed):
                         j.stopped = True
                         j.close()

@@ -223,7 +223,7 @@ def main():
             k = p.keep[by_num[n]]
             if isinstance(k, dict):
                 return 0.05 + run_s(n) * k["frac"]
-            return 1.4 + 0.5 * len(k)
+            return 0.55 * len(k)  # the class setup (1.4 s) is counted once in est_cpu
         return proxy_cost.get(n, run_s(n))
 
     def cls_of(n):
@@ -361,13 +361,11 @@ def main():
                 keep = pseudo_queries(res, c)
                 if keep is None:
                     keep = m.query_subset(by_num[c], res, c)
-                if (keep is None or len(keep) > E_SAMPLE) and m.e_cover:
-                    # too many (or unknown) queries: run the queries that between them execute
-                    # ~99% of the test's lines, preferring ones the change is known to reach.
-                    # A failure there is caught; scheduling the 21 s test unchecked costs more.
-                    pool = [q for q in m.e_cover if keep is None or q in keep]
-                    rest = [q for q in m.e_cover if q not in pool]
-                    keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
+                # No sampling: whether a query fails depends on its data (code generated for
+                # the Python executor only runs on rows that reach it), so a line-covering
+                # sample can pass while one of the reached queries fails. Either every query
+                # the change reaches runs, or the optimizer twin decides, or the test is
+                # scheduled unchecked.
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
                 if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
                     keep = None  # the optimizer twin is the cheaper check
@@ -420,13 +418,27 @@ def main():
             twins = {tw for s_, tw in p.decided_by.items()}
             hyb_run = slow | (twins & run)
             hyb_blind = set(cands) - slow - set(p.decided_by) - (twins & run if p.decided_by else set())
-            if hyb_run:
-                slow_all = slow | set(p.decided_by)
-                cost_h = (
-                    est_cpu(hyb_run, p)
-                    + (1 - P_FAIL) * pack_cost(hyb_blind, ms)
-                    + P_FAIL * pack_cost(hyb_blind | slow_all, ms)
+            # also consider checking the heaviest other candidates: when they pass, the
+            # unchecked rest may pack onto fewer / shorter workers
+            others = sorted((c for c in run if c not in hyb_run), key=lambda c: (-ms[c], c))
+            best_k, best_cost = None, None
+            slow_all = slow | set(p.decided_by)
+            for k in range(0, min(len(others), 40) + 1):
+                s_run = hyb_run | set(others[:k])
+                if not s_run:
+                    continue
+                s_blind = hyb_blind - set(others[:k])
+                cost_k = (
+                    est_cpu(s_run, p)
+                    + (1 - P_FAIL) * pack_cost(s_blind, ms)
+                    + P_FAIL * pack_cost(s_blind | slow_all | set(others[:k]), ms)
                 )
+                if best_cost is None or cost_k < best_cost - 1e-9:
+                    best_k, best_cost = k, cost_k
+            if best_k is not None:
+                hyb_run = hyb_run | set(others[:best_k])
+                hyb_blind = hyb_blind - set(others[:best_k])
+                cost_h = best_cost
                 if cost_h < cost_blind:
                     p.run = [c for c in p.run if c in hyb_run]
                     p.blind = hyb_blind
