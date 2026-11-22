@@ -164,12 +164,22 @@ def base_ident(v):
     return "?"
 
 
+lambda_reads = collections.defaultdict(lambda: collections.defaultdict(set))
 for rel, tree in trees.items():
+    in_lambda = set()
+    for lam in ast.walk(tree):
+        if isinstance(lam, ast.Lambda):
+            for x in ast.walk(lam.body):
+                in_lambda.add(id(x))
     for n in ast.walk(tree):
         if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and n.attr in assigned:
             reads[n.attr][rel].append([n.lineno, base_ident(n.value)])
+            if id(n) in in_lambda:
+                lambda_reads[n.attr][rel].add(n.lineno)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in assigned:
             reads[n.id][rel].append([n.lineno, ""])
+            if id(n) in in_lambda:
+                lambda_reads[n.id][rel].add(n.lineno)
         elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("getattr", "hasattr")
               and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, str)
               and n.args[1].value in assigned):
@@ -198,6 +208,7 @@ for t in tests:
                 tranges[str(t["number"])] = [meth_rng, other]
 subq = json.load(open("/home/claude/br/covq/subq_map.json")) if os.path.exists("/home/claude/br/covq/subq_map.json") else {}
 res = {
+    "lambda_reads": {k: {f: sorted(ls) for f, ls in v.items()} for k, v in lambda_reads.items()},
     "env_usage": env_usage,
     "tranges": tranges,
     "subq": subq,

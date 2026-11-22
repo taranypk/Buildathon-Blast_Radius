@@ -54,6 +54,8 @@ class Map:
         self.reads = data.get("reads", {})
         self.subq = data.get("subq", {})
         self.env_usage = data.get("env_usage", {})
+        # reads inside lambda bodies: they run when the lambda is called, never at import
+        self.lambda_reads = {k: {f: set(ls) for f, ls in v.items()} for k, v in data.get("lambda_reads", {}).items()}
         self.mro = data.get("mro", {})
         self.class_names = {k.split(":", 1)[1].split(".")[-1] for k in self.mro}
         self._trees = {}
@@ -131,8 +133,9 @@ class Map:
         res = []
         for f, ls in self.reads.get(name, {}).items():
             st = self.static.get(f, set())
+            lam = self.lambda_reads.get(name, {}).get(f, ())
             for l, base in ls:
-                if l not in st or (f, l) in skip:
+                if l not in st or (f, l) in skip or l in lam:
                     continue
                 if base.split(".")[0] in GENERIC:
                     continue
@@ -304,8 +307,9 @@ class Map:
         """Is `name` read at import time through self/cls (a metaclass deriving other data)?"""
         for f, ls in self.reads.get(name, {}).items():
             st = self.static.get(f, set())
+            lam = self.lambda_reads.get(name, {}).get(f, ())
             for l, base in ls:
-                if l in st and base.split(".")[0] in GENERIC:
+                if l in st and l not in lam and base.split(".")[0] in GENERIC:
                     return True
         return False
 
