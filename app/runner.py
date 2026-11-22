@@ -143,7 +143,22 @@ def _make_proxy(cls, meth, repl):
     return ns.get(meth)
 
 
-def _child(overlay: str, nodeids: list[str], wfd: int):
+def _filtered_mp_execute(mod, keep):
+    """TestExecutor._mp_execute that runs only the TPC-DS queries in `keep` (same indices)."""
+
+    def _mp_execute(self, schema, tables, sqls, tpch):
+        with SyncExecutor(initializer=mod.initializer, initargs=(schema, tables)) as pool:
+            for i, (args, sql, _) in enumerate(sqls):
+                if not tpch and i not in keep:
+                    continue
+                table = pool.submit(mod.mp_execute, mod.parse_one(sql), args).result()
+                if table is not None:
+                    self.subtestHelper(i, table, tpch=tpch)
+
+    return _mp_execute
+
+
+def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
     out = os.fdopen(wfd, "w", buffering=1)
 
     def emit(kind, nid):
@@ -194,6 +209,12 @@ def _child(overlay: str, nodeids: list[str], wfd: int):
                 continue
             for mth in meths:
                 nid = f"{path}::{cls_name}::{mth}"
+                if keep and nid in keep:
+                    try:
+                        setattr(cls, "_mp_execute", _filtered_mp_execute(mod, set(keep[nid])))
+                        emit("X", nid)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if nid in PROXIES:
                     try:
                         proxy = _make_proxy(cls, mth, PROXIES[nid])
@@ -266,7 +287,7 @@ def _child(overlay: str, nodeids: list[str], wfd: int):
 
 
 class Job:
-    def __init__(self, key, src_root, tmp_root, files, nodeids, timeout):
+    def __init__(self, key, src_root, tmp_root, files, nodeids, timeout, keep=None):
         self.key = key
         self.overlay = os.path.join(tmp_root, f"w-{key}")
         shutil.rmtree(self.overlay, ignore_errors=True)
@@ -279,7 +300,7 @@ class Job:
                 os.setpgid(0, 0)
             except Exception:
                 pass
-            _child(self.overlay, nodeids, w)
+            _child(self.overlay, nodeids, w, keep)
         os.close(w)
         self.pid, self.fd = pid, r
         self.deadline = time.monotonic() + timeout
@@ -342,9 +363,11 @@ def run_jobs(specs, src_root, tmp_root, parallel=2, on_done=None, should_stop=No
     results = {}
     while pending or running:
         while pending and len(running) < parallel:
-            key, files, nodeids, timeout = pending.pop(0)
+            spec = pending.pop(0)
+            key, files, nodeids, timeout = spec[:4]
+            keep = spec[4] if len(spec) > 4 else None
             try:
-                running.append(Job(key, src_root, tmp_root, files, nodeids, timeout))
+                running.append(Job(key, src_root, tmp_root, files, nodeids, timeout, keep))
             except Exception as e:  # noqa: BLE001
                 print(f"job {key} failed to start: {e!r}", file=sys.stderr)
                 results[key] = (set(), set(), False, set())

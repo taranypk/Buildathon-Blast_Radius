@@ -160,6 +160,31 @@ def same_ast(a: str, b: str) -> bool | None:
         return None
 
 
+class _NoneCompare(ast.NodeTransformer):
+    """`x is None` and `x == None` behave the same for every object compared with None
+    here, so normalise both (and `is not` / `!=`) before comparing two files."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and any(
+            isinstance(c, ast.Constant) and c.value is None for c in [node.left, *node.comparators]
+        ):
+            op = node.ops[0]
+            if isinstance(op, ast.Eq):
+                node.ops = [ast.Is()]
+            elif isinstance(op, ast.NotEq):
+                node.ops = [ast.IsNot()]
+        return node
+
+
+def same_ast_modulo_none_compare(a: str, b: str) -> bool:
+    try:
+        ta, tb = _NoneCompare().visit(ast.parse(a)), _NoneCompare().visit(ast.parse(b))
+        return ast.dump(ta) == ast.dump(tb)
+    except SyntaxError:
+        return False
+
+
 def added_new_lines(fd: FileDiff) -> set[int]:
     """New-file line numbers of added lines."""
     added: set[int] = set()

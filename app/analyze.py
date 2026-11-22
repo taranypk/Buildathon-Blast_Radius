@@ -40,10 +40,12 @@ class Map:
         self.opens = data["opens"]
         self.users = {k: set(v) for k, v in data.get("users", {}).items()}
         self.reads = data.get("reads", {})
+        self.subq = data.get("subq", {})
         self.mro = data.get("mro", {})
         self.class_names = {k.split(":", 1)[1].split(".")[-1] for k in self.mro}
         self._trees = {}
         self._desc = {}
+        self._chain = {}
         self.tests_by_file = {}  # filled by the caller: test file path -> test numbers
         self.always_on_import = set()  # filled by the caller: tests run in a subprocess
         self.by_simple = {}
@@ -107,27 +109,86 @@ class Map:
         covered) are ignored. module: the module whose global changed.
         """
         res = []
-        desc = self.desc_names(cls_key) if cls_key else None
         for f, ls in self.reads.get(name, {}).items():
             st = self.static.get(f, set())
             for l, base in ls:
                 if l not in st or (f, l) in skip:
                     continue
-                if base in GENERIC:
+                if base.split(".")[0] in GENERIC:
                     continue
                 if cls_key is not None:
                     if base == "":
                         if f != cls_key_file(cls_key):
                             continue
-                    elif base in self.class_names and base not in desc:
+                    elif not self.may_be_subclass(base, cls_key):
                         continue
                 else:
-                    if base in self.class_names:
+                    if self.match_classes(base):
                         continue
                     if base == "" and module and f != module and not imports_name(self, f, name):
                         continue
                 res.append((f, l))
         return res
+
+    def query_subset(self, test_id, res, num):
+        """Queries of a per-query-mapped test (TPC-DS) that run the changed lines, or None
+        when the change can reach the test some other way (then run or schedule it whole)."""
+        sq = self.subq.get(test_id)
+        if not sq:
+            return None
+        keep = set()
+        for s, where in zip(res.reasons, res.where):
+            if num not in s:
+                continue
+            if where is None:
+                return None
+            path, lines = where
+            ql = sq["q"].get(path, {})
+            outside = set(sq["outside"].get(path, []))
+            for l in lines:
+                if num not in self.lines.get(path, {}).get(l, ()):
+                    continue
+                if l in outside:
+                    return None
+                if str(l) not in ql:
+                    return None  # covered by the test but not seen per query: be safe
+                keep |= set(ql[str(l)])
+        return keep
+
+    def generic_static_read(self, name):
+        """Is `name` read at import time through self/cls (a metaclass deriving other data)?"""
+        for f, ls in self.reads.get(name, {}).items():
+            st = self.static.get(f, set())
+            for l, base in ls:
+                if l in st and base.split(".")[0] in GENERIC:
+                    return True
+        return False
+
+    def match_classes(self, chain):
+        """Class keys a dotted reference such as `tokens.Tokenizer` or `Postgres.Tokenizer` may name."""
+        if chain in self._chain:
+            return self._chain[chain]
+        parts = chain.split(".")
+        strict, loose = [], []
+        for k in self.mro:
+            mod, qual = k.split(":", 1)
+            q = qual.split(".")
+            if len(parts) >= len(q) and parts[-len(q):] == q:
+                rest = parts[: -len(q)]
+                # prefer matches whose prefix looks like the class's module
+                if not rest or rest[-1] == mod.split(".")[-1] or ".".join(rest) == mod:
+                    strict.append(k)
+                elif len(q) == 1 or len(rest) <= 1:
+                    loose.append(k)  # package re-export alias such as exp.Select
+        out = strict or loose
+        self._chain[chain] = out
+        return out
+
+    def may_be_subclass(self, chain, cls_key):
+        keys = self.match_classes(chain)
+        if not keys:
+            return True  # unknown reference: be conservative
+        return any(cls_key in self.mro.get(k, [k]) for k in keys)
 
     def tree(self, src_root, f):
         if f not in self._trees:
@@ -221,13 +282,15 @@ class Result:
     def __init__(self):
         self.cands: set[int] = set()
         self.reasons: list[set[int]] = []
+        self.where: list = []  # per reason: (path, lines) when it came from line coverage
         self.notes: list[str] = []
         self.everything = False
 
-    def add(self, s):
+    def add(self, s, where=None):
         s = set(s)
         if s:
             self.reasons.append(s)
+            self.where.append(where)
             self.cands |= s
 
 
@@ -285,7 +348,7 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
         readers = set()
         for n in names:
             readers |= m.readers(n)
-        if stat:
+        if stat or any(m.generic_static_read(n) for n in names):
             # the value feeds other import-time code (metaclass, subclass dicts)
             res.notes.append(f"class-attr-derived {q}.{','.join(sorted(names))}")
             out = set(scope) if tracked else set(scope) | readers
@@ -419,6 +482,9 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
         if new_text is not None and patchlib.same_ast(old_text, new_text):
             res.notes.append(f"same-ast {path}")
             continue
+        if new_text is not None and patchlib.same_ast_modulo_none_compare(old_text, new_text):
+            res.notes.append(f"none-compare-only {path}")
+            continue
         try:
             tree = ast.parse(old_text)
         except SyntaxError:
@@ -446,11 +512,11 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             in_header = lo <= line <= hi
             if not in_header:
                 # a blank/comment line inside a compound statement's body
-                res.add(m.tests_on(path, [line]))
+                res.add(m.tests_on(path, [line]), where=(path, {line}))
                 continue
             if is_docstring(node):
                 continue
-            res.add(m.tests_on(path, range(lo, hi + 1)))
+            res.add(m.tests_on(path, range(lo, hi + 1)), where=(path, set(range(lo, hi + 1))))
             in_func = any(isinstance(c, FUNC) for c in chain[1:])
             if in_func:
                 if m.static.get(path, set()) & set(range(lo, hi + 1)):

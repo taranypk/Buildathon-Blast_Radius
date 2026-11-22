@@ -83,6 +83,7 @@ class Plan:
         self.run = []          # ordered test numbers to check
         self.blind = set()     # scheduled without checking
         self.decided_by = {}   # slow test -> twin whose result decides it
+        self.keep = {}         # test id -> query indices to run (per-query mapped tests)
         self.est = 0.0
 
 
@@ -106,18 +107,22 @@ def main():
     twin = {by_id[k]: by_id[v] for k, v in PROXY_BY.items() if k in by_id and v in by_id}
     proxy_cost = {by_id[k]: v for k, v in PROXY_COST.items() if k in by_id}
 
-    def eff(n):
+    subq_tests = {by_id[k] for k in m.subq if k in by_id}
+
+    def eff(n, p=None):
+        if p is not None and by_num[n] in p.keep:
+            return 1.4 + 0.5 * len(p.keep[by_num[n]])
         return proxy_cost.get(n, ms[n] / 1000)
 
     def cls_of(n):
         return by_num[n].rsplit("::", 1)[0]
 
-    def est_cpu(nums):
+    def est_cpu(nums, p=None):
         nums = set(nums)
         if not nums:
             return 0.0
         setup = sum(v for k, v in CLASS_SETUP.items() if any(cls_of(n) == k for n in nums))
-        return 0.15 + setup + CPU_FACTOR * sum(eff(n) for n in nums)
+        return 0.15 + setup + CPU_FACTOR * sum(eff(n, p) for n in nums)
 
     out = {}
     plans: dict[str, Plan] = {}
@@ -152,7 +157,21 @@ def main():
             continue
         p = Plan(cid, cands, files)
         run = set()
-        for c in cands:
+        for c in list(cands):
+            if c in subq_tests and res is not None and c not in run:
+                keep = m.query_subset(by_num[c], res, c)
+                twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
+                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
+                    keep = None  # the optimizer twin is the cheaper check
+                if keep is not None:
+                    if not keep:
+                        # the change only touches lines this test never runs per query
+                        cands.discard(c)
+                        p.cands.discard(c)
+                        continue
+                    p.keep[by_num[c]] = sorted(keep)
+                    run.add(c)
+                    continue
             if ms[c] <= RUN_LIMIT_S * 1000 or c in proxy_cost:
                 run.add(c)
             elif c in twin and res is not None and all(twin[c] in r for r in res.reasons if c in r):
@@ -164,9 +183,9 @@ def main():
         groups = {}
         for c in run:
             groups.setdefault(cls_of(c), []).append(c)
-        order = sorted(groups.values(), key=lambda g: (min(eff(c) for c in g) + CLASS_SETUP.get(cls_of(g[0]), 0)))
-        p.run = [c for g in order for c in sorted(g, key=lambda c: (eff(c), c))]
-        p.est = est_cpu(run)
+        order = sorted(groups.values(), key=lambda g: (min(eff(c, p) for c in g) + CLASS_SETUP.get(cls_of(g[0]), 0)))
+        p.run = [c for g in order for c in sorted(g, key=lambda c: (eff(c, p), c))]
+        p.est = est_cpu(run, p)
         # schedule everything blind when that is expected to be cheaper than checking
         cost_blind = pack_cost(cands, ms)
         slow_if_fail = set(p.decided_by)
@@ -190,7 +209,7 @@ def main():
             log(p.cid, "blind (budget)")
             continue
         timeout = max(10.0, p.est * 3 + 8)
-        specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout))
+        specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout, p.keep))
 
     def final_set(p, failed, passed, done, broken=()):
         fail_nums = {by_id[n] for n in failed if n in by_id}
@@ -217,7 +236,7 @@ def main():
         now = final_set(p, failed, passed, True)
         if_stop = final_set(p, failed, passed, False)
         delta = pack_cost(if_stop, ms) - pack_cost(now, ms)
-        rem_cpu = est_cpu(remaining)
+        rem_cpu = est_cpu(remaining, p)
         return (1 - P_FAIL) * delta < rem_cpu
 
     def finish(cid, result):
