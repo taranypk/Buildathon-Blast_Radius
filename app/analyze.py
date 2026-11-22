@@ -340,6 +340,24 @@ def _owner_users(m, key):
     return out
 
 
+def import_time_func_effect(m, src_root, path, node, chain, res):
+    fn = [c for c in chain if isinstance(c, FUNC)][-1]
+    out = m.tests_in_range(path, fn.lineno, fn.end_lineno or fn.lineno)
+    names = assigned_names(node)
+    attr_names = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)}
+    if not attr_names:
+        # a condition/loop line: everything the function assigns onto objects
+        attr_names = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)}
+    for n in attr_names:
+        out |= m.readers(n)
+    # import-time call sites of this function (class bodies calling a factory)
+    seen = set()
+    for f, l in m.static_reads(fn.name, set()):
+        out |= _static_line(m, src_root, f, l, res, 0, seen)
+    res.notes.append(f"import-time-func {path}:{fn.name} attrs={len(attr_names)} locals={len(names)}")
+    return out
+
+
 def _static_line(m, src_root, f, line, res, depth, seen, owner=None):
     tree = m.tree(src_root, f)
     if tree is None:
@@ -435,6 +453,10 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             res.add(m.tests_on(path, range(lo, hi + 1)))
             in_func = any(isinstance(c, FUNC) for c in chain[1:])
             if in_func:
+                if m.static.get(path, set()) & set(range(lo, hi + 1)):
+                    # function code that runs at import time (metaclass, factory called
+                    # from a class body): follow what it assigns and where it is called
+                    res.add(import_time_func_effect(m, src_root, path, node, chain, res))
                 continue
             res.add(static_effect(m, src_root, path, node, chain, res))
             # import-time data naming a class (registries such as DIALECTS = ["Tableau", ...]):
