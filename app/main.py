@@ -101,8 +101,8 @@ def main():
     patches = sorted(p for p in os.listdir(cdir) if p.endswith(".patch"))
     n_commits = len(patches)
     budget = max(40.0, 3.6 * n_commits)  # the scorer allows ~4.5 s of wall time per commit
-    twin = {by_id[k]: by_id[v] for k, v in PROXY_BY.items() if k in by_id and v in by_id}
-    proxy_cost = {by_id[k]: v for k, v in PROXY_COST.items() if k in by_id}
+    twin = {}  # PROBE: no twin rule
+    proxy_cost = {}  # PROBE: no cheap stand-ins
 
     def eff(n):
         return proxy_cost.get(n, ms[n] / 1000)
