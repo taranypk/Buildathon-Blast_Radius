@@ -353,6 +353,10 @@ class Job:
         shutil.rmtree(self.overlay, ignore_errors=True)
         build_overlay(src_root, self.overlay, files)
         r, w = os.pipe()
+        # The parent holds the large coverage map: freeze it so the child's garbage
+        # collections (tests call gc.collect()) never traverse it.
+        import gc
+        gc.freeze()
         pid = os.fork()
         if pid == 0:
             os.close(r)
