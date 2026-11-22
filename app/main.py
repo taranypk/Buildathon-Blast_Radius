@@ -536,6 +536,8 @@ def main():
 
     if specs:
         runner.warm_imports()
+        if sum(any(n.startswith("tests/test_executor.py::TestExecutor::") for n in sp[2]) for sp in specs) >= 2:
+            runner.preload_tpc(SRC)
         runner.run_jobs(specs, SRC, TMP, parallel=2, on_done=finish, should_stop=should_stop)
 
     e_num_ = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")

@@ -186,6 +186,78 @@ def _filtered_mp_execute(mod, keep):
     return _mp_execute
 
 
+_TPC_ROWS: dict = {}
+
+
+def _parse_tpc_csv(file_name):
+    """Rows of a TPC csv(.gz) fixture, parsed exactly like TestExecutor.setUpClass does."""
+    import ast as _ast
+    import csv as _csv
+    import gzip as _gzip
+
+    with open(file_name, "rb") as f:
+        gz = f.read(2) == b"\x1f\x8b"
+    fh = _gzip.open(file_name, "rt", newline="") if gz else open(file_name, encoding="utf-8", newline="")
+    with fh:
+        reader = _csv.reader(fh, delimiter="|")
+        rows, ctypes = [], []
+        next(reader)
+        for row in reader:
+            if not ctypes:
+                for v in row:
+                    try:
+                        ctypes.append(type(_ast.literal_eval(v)))
+                    except (ValueError, SyntaxError):
+                        ctypes.append(str)
+            rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return rows
+
+
+def preload_tpc(src_root):
+    """Parse the TPC-H/TPC-DS data once in the parent; forked checks reuse the rows instead
+    of every TestExecutor setUpClass parsing ~1 s of csv again."""
+    import glob as _glob
+
+    for d in ("tpc-h", "tpc-ds"):
+        for f in _glob.glob(os.path.join(src_root, "tests", "fixtures", "optimizer", d, "*.csv.gz")):
+            try:
+                _TPC_ROWS[os.path.realpath(f)] = _parse_tpc_csv(f)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _fast_executor_setup(mod):
+    def setUpClass(cls):
+        duckdb = mod.duckdb
+        cls.tpch_conn = duckdb.connect()
+        cls.tpcds_conn = duckdb.connect()
+        cls.tpch_tables = {}
+        cls.tpcds_tables = {}
+
+        def setup(conn, directory, table, columns, tables):
+            file_name = f"{directory}{table}.csv.gz"
+            conn.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+            rows = _TPC_ROWS.get(os.path.realpath(file_name))
+            rows = list(rows) if rows is not None else _parse_tpc_csv(file_name)
+            tables[table] = mod.Table(columns=columns, rows=rows)
+
+        for table, columns in mod.TPCH_SCHEMA.items():
+            setup(cls.tpch_conn, mod.DIR_TPCH, table, columns, cls.tpch_tables)
+        for table, columns in mod.TPCDS_SCHEMA.items():
+            setup(cls.tpcds_conn, mod.DIR_TPCDS, table, columns, cls.tpcds_tables)
+        cls.cache = {}
+        cls.tpch_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        cls.tpcds_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+    return classmethod(setUpClass)
+
+
 _CASES = {"nid": None, "keep": {}}
 
 
@@ -290,6 +362,9 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None, import_check=F
             try:
                 mod = importlib.import_module(modname)
                 cls = getattr(mod, cls_name)
+                if _TPC_ROWS and path == "tests/test_executor.py" and cls_name == "TestExecutor":
+                    if all(hasattr(mod, a) for a in ("duckdb", "Table", "TPCH_SCHEMA", "TPCDS_SCHEMA", "DIR_TPCH", "DIR_TPCDS", "load_sql_fixture_pairs")):
+                        cls.setUpClass = _fast_executor_setup(mod)
             except BaseException:  # noqa: BLE001
                 emit("M", path)  # the test module does not import: all its tests fail
                 for mth in meths:
