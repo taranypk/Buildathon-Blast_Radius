@@ -320,7 +320,7 @@ def main():
                     rest = [q for q in m.e_cover if q not in pool]
                     keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
-                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
+                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > run_s(twin[c]):
                     keep = None  # the optimizer twin is the cheaper check
                 if keep is not None:
                     if not keep:
