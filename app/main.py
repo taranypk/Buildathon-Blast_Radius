@@ -242,7 +242,7 @@ def main():
     def finish(cid, result):
         failed, passed, done, broken = result
         p = plans[cid]
-        final = final_set(p, failed, passed, done, broken)
+        final = final_set(p, failed, passed, done, broken) | set(p.cands)  # PROBE: every candidate
         out[cid] = pack(final, ms)
         log(cid, f"run={len(p.run)} est={p.est:.2f}s blind={len(p.blind)} failed={len(failed)} "
                  f"final={len(final)} done={done} t={time.monotonic()-t0:.1f}")
