@@ -45,6 +45,18 @@ class Map:
         self._trees = {}
         self._desc = {}
         self.tests_by_file = {}  # filled by the caller: test file path -> test numbers
+        self.always_on_import = set()  # filled by the caller: tests run in a subprocess
+        self.by_simple = {}
+        for k in self.users:
+            self.by_simple.setdefault(k.split(":", 1)[1].split(".")[-1], []).append(k)
+
+    def users_named(self, words):
+        """Users of classes whose simple name appears in `words` (case-insensitive)."""
+        out = set()
+        for w in words:
+            for k in self.by_simple.get(w, ()):
+                out |= self.users[k]
+        return out
 
     def desc_names(self, key):
         """Simple names of `key` and every class that inherits from it."""
@@ -185,6 +197,18 @@ def assigned_names(node):
     return names
 
 
+def _words(text):
+    """Identifiers spelled inside string literals on this line ("Tableau" in a registry)."""
+    import re
+
+    out = set()
+    for lit in re.findall(r"\"([^\"\\]*)\"|'([^'\\]*)'", text):
+        for s in lit:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,}", s):
+                out.add(s)
+    return out
+
+
 def is_docstring(node):
     return (
         isinstance(node, ast.Expr)
@@ -264,12 +288,16 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
         if stat:
             # the value feeds other import-time code (metaclass, subclass dicts)
             res.notes.append(f"class-attr-derived {q}.{','.join(sorted(names))}")
-            out = set(scope)
+            out = set(scope) if tracked else set(scope) | readers
             for f, l in stat:
                 out |= _static_line(m, src_root, f, l, res, depth, seen, owner=q)
             return out
         res.notes.append(f"class-attr {q}.{','.join(sorted(names))} tracked={tracked}")
-        return (scope & readers) if readers else scope
+        if tracked:
+            # instances are recorded: users of the class that also read the name
+            return (scope & readers) if readers else scope
+        # enums, schema/scope/executor classes: no instance record, so every reader
+        return readers | scope
     # module level
     if isinstance(node, ast.ClassDef):
         scope, q, _ = class_scope(m, path, [node])
@@ -282,6 +310,9 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
     if path.startswith("tests/") and os.path.basename(path).startswith("test_"):
         # module level of a test file: every test in it (import errors fail them all)
         out |= m.tests_by_file.get(path, set())
+    if path.startswith("sqlglot/"):
+        # tests that import sqlglot in a subprocess (lazy-loading checks) see no coverage
+        out |= m.always_on_import
     if isinstance(node, (ast.Import, ast.ImportFrom)):
         # an import binds names in this module only
         for n in names:
@@ -386,6 +417,8 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             res.everything = True
             continue
         removed, border = patchlib.changed_old_lines(fd)
+        old_lines = old_text.split("\n")
+        new_lines = new_text.split("\n")
         for line in sorted(removed | border):
             hit = innermost(tree, line)
             if hit is None:
@@ -404,6 +437,9 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             if in_func:
                 continue
             res.add(static_effect(m, src_root, path, node, chain, res))
+            # import-time data naming a class (registries such as DIALECTS = ["Tableau", ...]):
+            # every test that uses that class, since lookups are cached after first use
+            res.add(m.users_named(_words(old_lines[line - 1] if line - 1 < len(old_lines) else "")))
         # added import-time statements: judge them by the names they define
         try:
             new_tree = ast.parse(new_text)
@@ -421,4 +457,5 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 if not (lo <= line <= hi):
                     continue
                 res.add(static_effect(m, src_root, path, node, chain, res, seen={("new", path, node.lineno)}))
+                res.add(m.users_named(_words(new_lines[line - 1] if line - 1 < len(new_lines) else "")))
     return res

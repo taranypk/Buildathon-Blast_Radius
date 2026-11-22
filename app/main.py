@@ -97,6 +97,8 @@ def main():
         m = analyze.Map(json.load(f))
     for t in tests:
         m.tests_by_file.setdefault(t["file"], set()).add(t["number"])
+        if t["id"].endswith("::test_lazy_load"):
+            m.always_on_import.add(t["number"])
     cdir = os.path.join(DATA, "commits")
     patches = sorted(p for p in os.listdir(cdir) if p.endswith(".patch"))
     n_commits = len(patches)
