@@ -143,6 +143,21 @@ def exec_fixture_queries(path, old_text, new_text):
     return {i for i, (x, y) in enumerate(zip(a, b)) if x[0] != y[0] or x[1] != y[1]}
 
 
+def _load_data(json_gz):
+    """A data file, from its pickled twin (faster to load) when there is one."""
+    pkl = json_gz[: -len(".json.gz")] + ".pkl.gz" if json_gz.endswith(".json.gz") else None
+    if pkl and os.path.exists(pkl):
+        try:
+            import pickle
+
+            with open(pkl, "rb") as f:
+                return pickle.loads(gzip.decompress(f.read()))
+        except Exception:  # noqa: BLE001
+            pass
+    with gzip.open(json_gz, "rt") as f:
+        return json.load(f)
+
+
 def pack_cost(nums, ms):
     w = pack(nums, ms)
     if not w:
@@ -170,8 +185,7 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     by_id = {t["id"]: t["number"] for t in tests}
     by_num = {t["number"]: t["id"] for t in tests}
-    with gzip.open(MAP, "rt") as f:
-        m = analyze.Map(json.load(f))
+    m = analyze.Map(_load_data(MAP))
     for t in tests:
         m.tests_by_file.setdefault(t["file"], set()).add(t["number"])
         m.id_of[t["number"]] = t["id"]
@@ -201,8 +215,7 @@ def main():
     def casemap():
         if "m" not in casemap_box:
             try:
-                with gzip.open(os.path.join(HERE, "casemap.json.gz"), "rt") as fh:
-                    casemap_box["m"] = json.load(fh)
+                casemap_box["m"] = _load_data(os.path.join(HERE, "casemap.json.gz"))
             except Exception:  # noqa: BLE001
                 casemap_box["m"] = {}
         return casemap_box["m"]
