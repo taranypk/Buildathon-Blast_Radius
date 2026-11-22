@@ -233,6 +233,14 @@ class Map:
                 pass
         return self._qtext.get(i)
 
+    def exp_users(self, names):
+        out = set()
+        for n in names:
+            for k in self.by_simple.get(n, ()):
+                if k.startswith("sqlglot.expressions."):
+                    out |= self.users[k]
+        return out
+
     def key_filter(self, src_root, tests, keys):
         out = set()
         hit = {}
@@ -433,6 +441,34 @@ def sql_keyed(m, path, chain):
     q = module_name(path) + ":" + ".".join(c.name for c in classes)
     mro = m.mro.get(q, ())
     return "sqlglot.tokens:Tokenizer" in mro or "sqlglot.parser:Parser" in mro
+
+
+def exp_keys(node, line, lines_):
+    """Expression classes used as dict keys on a changed entry line (`exp.Foo: ...`), for
+    tables dispatched by node type (generator TRANSFORMS and friends). None if not that shape."""
+    import re
+
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)) or not isinstance(getattr(node, "value", None), ast.Dict):
+        return None
+    if line <= node.lineno:
+        return None
+    text = lines_[line - 1] if line - 1 < len(lines_) else ""
+    keys = re.findall(r"\bexp\.([A-Z][A-Za-z0-9_]*)\s*:", text)
+    stripped = text.strip()
+    # the line must start with the key (an entry), not be a continuation of a value
+    if not keys or not re.match(r"exp\.[A-Z]", stripped):
+        return None
+    return set(keys)
+
+
+def enclosing_lambda(node, line):
+    """Innermost lambda inside `node` whose span contains `line`."""
+    best = None
+    for n in ast.walk(node):
+        if isinstance(n, ast.Lambda) and n.lineno <= line <= (n.end_lineno or n.lineno):
+            if best is None or n.lineno >= best.lineno:
+                best = n
+    return best
 
 
 def is_docstring(node):
@@ -699,6 +735,14 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 continue
             if is_docstring(node):
                 continue
+            lam = enclosing_lambda(node, line)
+            if lam is not None and line > lam.lineno:
+                # inside a lambda body (a table entry's code): it runs only when called,
+                # so the tests that ran those lines are exactly the ones affected
+                lines_l = set(range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
+                res.add(m.tests_on(path, lines_l), where=(path, lines_l))
+                res.notes.append(f"lambda-body {path}:{line}")
+                continue
             res.add(m.tests_on(path, range(lo, hi + 1)), where=(path, set(range(lo, hi + 1))))
             if (
                 path == "sqlglot/dialects/__init__.py"
@@ -715,6 +759,14 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                     res.add(import_time_func_effect(m, src_root, path, node, chain, res))
                 continue
             eff = static_effect(m, src_root, path, node, chain, res)
+            ek_old = exp_keys(node, line, old_lines)
+            if ek_old:
+                # a node-type dispatch entry only matters to tests that build that node type
+                ek = set(ek_old)
+                ek |= exp_keys(node, line, new_lines) or set()
+                kept = eff & m.exp_users(ek)
+                res.notes.append(f"exp-key {sorted(ek)[:3]} {len(eff)}->{len(kept)}")
+                eff = kept
             keys = entry_keys(node, line, old_lines, new_lines) if sql_keyed(m, path, chain) else None
             if keys and m.id_of:
                 kept = m.key_filter(src_root, eff, keys)
@@ -741,6 +793,9 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 if not (lo <= line <= hi):
                     continue
                 eff = static_effect(m, src_root, path, node, chain, res, seen={("new", path, node.lineno)})
+                ek = exp_keys(node, line, new_lines)
+                if ek:
+                    eff = eff & m.exp_users(ek)
                 keys = entry_keys(node, line, new_lines, new_lines) if sql_keyed(m, path, chain) else None
                 if keys and m.id_of:
                     eff = m.key_filter(src_root, eff, keys)
