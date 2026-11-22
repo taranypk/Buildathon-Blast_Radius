@@ -15,6 +15,7 @@ import os
 import patchlib
 
 FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
+DEF = FUNC + (ast.ClassDef,)
 GENERIC = {"self", "cls", "klass", "kls", "mcs", "metacls", "this"}
 # classes whose instances the map-building plugin records (see tools/mapplug.py)
 TRACKED_BASES = {
@@ -31,14 +32,17 @@ def cls_key_file(key):
 
 
 def imports_name(m, f, name, src_root=None):
-    tree = m.tree(src_root, f) if src_root else m._trees.get(f)
-    if tree is None:
-        return True
-    for n in ast.walk(tree):
-        if isinstance(n, ast.ImportFrom) and any((a.asname or a.name) == name for a in n.names):
+    cache = m.__dict__.setdefault("_imported", {})
+    if f not in cache:
+        tree = m.tree(src_root, f) if src_root else m._trees.get(f)
+        if tree is None:
             return True
-    return False
-DEF = FUNC + (ast.ClassDef,)
+        names = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                names.update(a.asname or a.name for a in n.names)
+        cache[f] = names
+    return name in cache[f]
 
 
 class Map:
@@ -57,7 +61,11 @@ class Map:
         self.tests_by_file = {}  # filled by the caller: test file path -> test numbers
         self.always_on_import = set()  # filled by the caller: tests run in a subprocess
         self.id_of = {}  # filled by the caller: test number -> test id
-        self._ttext = None
+        self.tranges = data.get("tranges", {})
+        self._ttext = {}
+        self._flines = {}
+        self._fixture_text = {}
+        self._opened_by = None
         self.by_simple = {}
         for k in self.users:
             self.by_simple.setdefault(k.split(":", 1)[1].split(".")[-1], []).append(k)
@@ -165,62 +173,71 @@ class Map:
                 keep |= set(ql[str(l)])
         return keep
 
-    def test_texts(self, src_root):
-        """test number -> lower-cased text of its method, its class body and the fixtures it opens."""
-        if self._ttext is not None:
-            return self._ttext
-        opened = {}
-        for p, ts in self.opens.items():
-            for t in ts:
-                if t >= 0:
-                    opened.setdefault(t, []).append(p)
-        fixture_text = {}
-        by_file = {}
-        for n, tid in self.id_of.items():
-            by_file.setdefault(tid.split("::")[0], []).append((n, tid))
-        out = {}
-        for f, items in by_file.items():
+    def test_text(self, src_root, n):
+        """Lower-cased text of test n's method, its class body and the fixtures it opens;
+        None when it should never be filtered out."""
+        if n in self._ttext:
+            return self._ttext[n]
+        tid = self.id_of.get(n)
+        rng = self.tranges.get(str(n))
+        if tid is None or rng is None:
+            self._ttext[n] = None
+            return None
+        f = tid.split("::")[0]
+        if f not in self._flines:
             try:
-                src = open(os.path.join(src_root, f), encoding="utf-8").read()
-                tree = ast.parse(src)
+                self._flines[f] = open(os.path.join(src_root, f), encoding="utf-8").read().split("\n")
             except Exception:  # noqa: BLE001
-                for n, _ in items:
-                    out[n] = None
+                self._flines[f] = None
+        lines = self._flines[f]
+        if lines is None:
+            self._ttext[n] = None
+            return None
+        (ms, me), other = rng
+        parts = ["\n".join(lines[ms - 1 : me])] + ["\n".join(lines[a - 1 : b]) for a, b in other]
+        text = "\n".join(parts).lower()
+        if "dialects" in text or ".classes" in text or "for name in" in text:
+            self._ttext[n] = None  # iterates over every dialect / mapping: keep it
+            return None
+        self._ttext[n] = (text, tuple(self._opened().get(n, ())))
+        return self._ttext[n]
+
+    def _fixture(self, src_root, p):
+        if p not in self._fixture_text:
+            try:
+                self._fixture_text[p] = open(os.path.join(src_root, p), encoding="utf-8", errors="replace").read().lower()
+            except Exception:  # noqa: BLE001
+                self._fixture_text[p] = ""
+        return self._fixture_text[p]
+
+    def _opened(self):
+        if self._opened_by is None:
+            self._opened_by = {}
+            for p, ts in self.opens.items():
+                for t in ts:
+                    if t >= 0:
+                        self._opened_by.setdefault(t, []).append(p)
+        return self._opened_by
+
+    def key_filter(self, src_root, tests, keys):
+        out = set()
+        hit = {}
+        for t in tests:
+            tt = self.test_text(src_root, t)
+            if tt is None:
+                out.add(t)
                 continue
-            lines = src.split("\n")
-            classes = {c.name: c for c in tree.body if isinstance(c, ast.ClassDef)}
-            for n, tid in items:
-                _, cname, meth = tid.split("::")
-                c = classes.get(cname)
-                if c is None:
-                    out[n] = None  # inherited or generated test: no filtering
-                    continue
-                parts = []
-                found = False
-                for ch in c.body:
-                    seg = "\n".join(lines[ch.lineno - 1 : ch.end_lineno])
-                    if isinstance(ch, FUNC):
-                        if ch.name == meth:
-                            parts.append(seg)
-                            found = True
-                    else:
-                        parts.append(seg)
-                if not found:
-                    out[n] = None
-                    continue
-                for p in opened.get(n, []):
-                    if p not in fixture_text:
-                        try:
-                            fixture_text[p] = open(os.path.join(src_root, p), encoding="utf-8", errors="replace").read().lower()
-                        except Exception:  # noqa: BLE001
-                            fixture_text[p] = ""
-                    parts.append(fixture_text[p])
-                text = "\n".join(parts).lower()
-                if "dialects" in text or ".classes" in text or "for name in" in text:
-                    out[n] = None  # iterates over every dialect / mapping: keep it
-                else:
-                    out[n] = text
-        self._ttext = out
+            text, fixtures = tt
+            if any(k in text for k in keys):
+                out.add(t)
+                continue
+            for p in fixtures:
+                if p not in hit:
+                    ft = self._fixture(src_root, p)
+                    hit[p] = any(k in ft for k in keys)
+                if hit[p]:
+                    out.add(t)
+                    break
         return out
 
     def generic_static_read(self, name):
@@ -638,8 +655,7 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             eff = static_effect(m, src_root, path, node, chain, res)
             keys = entry_keys(node, line, old_lines, new_lines) if sql_keyed(m, path, chain) else None
             if keys and m.id_of:
-                texts = m.test_texts(src_root)
-                kept = {t for t in eff if texts.get(t) is None or any(k in texts[t] for k in keys)}
+                kept = m.key_filter(src_root, eff, keys)
                 res.notes.append(f"key-filter {sorted(keys)[:3]} {len(eff)}->{len(kept)}")
                 eff = kept
             res.add(eff)
@@ -665,8 +681,7 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 eff = static_effect(m, src_root, path, node, chain, res, seen={("new", path, node.lineno)})
                 keys = entry_keys(node, line, new_lines, new_lines) if sql_keyed(m, path, chain) else None
                 if keys and m.id_of:
-                    texts = m.test_texts(src_root)
-                    eff = {t for t in eff if texts.get(t) is None or any(k in texts[t] for k in keys)}
+                    eff = m.key_filter(src_root, eff, keys)
                 res.add(eff)
                 res.add(m.users_named(_words(new_lines[line - 1] if line - 1 < len(new_lines) else "")))
     return res
