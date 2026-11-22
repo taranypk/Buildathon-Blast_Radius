@@ -342,6 +342,28 @@ def main():
         cost_check = (1 - P_FAIL) * lo + P_FAIL * hi
         p.import_check = bool(res is not None and res.import_risk)
         if not run or cost_blind <= cost_check:
+            # schedule the candidates unchecked, except slow tests that have a cheap check
+            # (stand-ins, the TPC-DS query sample, an optimizer twin): those are checked and
+            # scheduled only if the check fails
+            slow = {c for c in run if ms[c] >= 2000 and eff(c, p) * CPU_FACTOR + 1.0 < ms[c] / 1000}
+            twins = {tw for s_, tw in p.decided_by.items()}
+            hyb_run = slow | (twins & run)
+            hyb_blind = set(cands) - slow - set(p.decided_by) - (twins & run if p.decided_by else set())
+            if hyb_run:
+                slow_all = slow | set(p.decided_by)
+                cost_h = (
+                    est_cpu(hyb_run, p)
+                    + (1 - P_FAIL) * pack_cost(hyb_blind, ms)
+                    + P_FAIL * pack_cost(hyb_blind | slow_all, ms)
+                )
+                if cost_h < cost_blind:
+                    p.run = [c for c in p.run if c in hyb_run]
+                    p.blind = hyb_blind
+                    p.decided_by = {k: v for k, v in p.decided_by.items() if v in hyb_run}
+                    p.est = est_cpu(hyb_run, p)
+                    plans[cid] = p
+                    log(cid, f"hybrid run={len(hyb_run)} blind={len(hyb_blind)} cost={cost_h:.1f} vs blind {cost_blind:.1f}")
+                    continue
             out[cid] = pack(cands, ms)
             log(cid, f"blind cands={len(cands)} blind_cost={cost_blind:.1f} check_cost={cost_check:.1f}")
             if p.import_check:
@@ -361,7 +383,7 @@ def main():
             out[p.cid] = pack(p.cands, ms)
             log(p.cid, "blind (budget)")
             continue
-        timeout = max(20.0, p.est * 5 + 10)
+        timeout = max(12.0, p.est * 3 + 6)
         specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout, p.keep, p.import_check))
 
     def final_set(p, failed, passed, done, broken=()):
