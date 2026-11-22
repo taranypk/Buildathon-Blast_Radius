@@ -462,7 +462,7 @@ def exp_keys(node, line, lines_):
     return set(keys)
 
 
-def env_entry_effect(m, path, node, line, old_lines, new_lines):
+def env_entry_effect(m, path, node, line, old_lines, new_lines, added=False):
     """Tests and TPC-DS queries (pseudo-tests) calling the ENV function on a changed entry
     line of sqlglot/executor/env.py's ENV table; None when the rule does not apply."""
     import re
@@ -473,15 +473,23 @@ def env_entry_effect(m, path, node, line, old_lines, new_lines):
         return None
     if line <= node.lineno:
         return None
-    keys = set()
+    keys = []
     for text in (old_lines[line - 1] if line - 1 < len(old_lines) else "", new_lines[line - 1] if line - 1 < len(new_lines) else ""):
         mt = re.match(r'\s*["\']([^"\']+)["\']\s*:', text)
         if not mt:
             return None
-        keys.add(mt.group(1))
+        keys.append(mt.group(1))
     callables = set(m.env_usage.get("callables", ()))
-    if not keys or not keys <= callables:
-        return None  # not a plain function entry (e.g. the `exp` module): no usage record
+    if added:
+        # judged by the new line alone: a key nobody calls yet affects no test, and the
+        # old-line pass already handles whatever entry this line replaced
+        last = keys[-1]
+        keys = [last]
+        if last not in callables:
+            return set()
+    elif keys[0] not in callables:
+        return None  # the original entry is not a plain function (e.g. the `exp` module)
+    keys = set(keys)
     out = set()
     for k in keys:
         out |= set(m.env_usage.get("tests", {}).get(k, ()))
@@ -832,7 +840,7 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 lo, hi = header_range(node)
                 if not (lo <= line <= hi):
                     continue
-                env_eff = env_entry_effect(m, path, node, line, new_lines, new_lines)
+                env_eff = env_entry_effect(m, path, node, line, new_lines, new_lines, added=True)
                 if env_eff is not None:
                     res.add(env_eff)
                     continue
