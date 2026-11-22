@@ -399,6 +399,8 @@ class Result:
         self.where: list = []  # per reason: (path, lines) when it came from line coverage
         self.notes: list[str] = []
         self.everything = False
+        # failures here depend on test order (shared registries): never trust a partial check
+        self.no_check = False
 
     def add(self, s, where=None):
         s = set(s)
@@ -645,6 +647,13 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             if is_docstring(node):
                 continue
             res.add(m.tests_on(path, range(lo, hi + 1)), where=(path, set(range(lo, hi + 1))))
+            if (
+                path == "sqlglot/dialects/__init__.py"
+                or (path == "sqlglot/__init__.py" and not any(isinstance(c, FUNC) for c in chain[1:]))
+                or (path == "sqlglot/dialects/dialect.py" and any(isinstance(c, ast.ClassDef) and c.name == "_Dialect" for c in chain))
+            ):
+                res.no_check = True
+                res.notes.append(f"global-state {path}")
             in_func = any(isinstance(c, FUNC) for c in chain[1:])
             if in_func:
                 if m.static.get(path, set()) & set(range(lo, hi + 1)):

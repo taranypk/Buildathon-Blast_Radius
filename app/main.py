@@ -175,6 +175,10 @@ def main():
         except Exception as e:  # noqa: BLE001
             log(cid, "analyze failed", repr(e))
             res, cands = None, set(ms)
+        if cands and res is not None and res.no_check:
+            out[cid] = pack(cands, ms)
+            log(cid, f"blind (global state) cands={len(cands)}")
+            continue
         if not cands:
             out[cid] = []
             log(cid, "no candidates", res.notes[:4] if res else "")
