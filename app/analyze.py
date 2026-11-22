@@ -528,6 +528,8 @@ class Result:
         self.everything = False
         # failures here depend on test order (shared registries): never trust a partial check
         self.no_check = False
+        # the change runs at import time: check that every sqlglot module still imports
+        self.import_risk = False
 
     def add(self, s, where=None):
         s = set(s)
@@ -784,6 +786,8 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 res.notes.append(f"lambda-body {path}:{line}")
                 continue
             in_func = any(isinstance(c, FUNC) for c in chain[1:])
+            if path.startswith("sqlglot/") and (not in_func or line in m.static.get(path, ())):
+                res.import_risk = True
             env_eff0 = None if in_func else env_entry_effect(m, path, node, line, old_lines, new_lines)
             if env_eff0 is not None:
                 # an executor ENV entry: only the tests / TPC-DS queries that call it

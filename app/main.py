@@ -142,6 +142,7 @@ class Plan:
         self.blind = set()     # scheduled without checking
         self.decided_by = {}   # slow test -> twin whose result decides it
         self.keep = {}         # test id -> query indices to run (per-query mapped tests)
+        self.import_check = False
         self.est = 0.0
 
 
@@ -331,9 +332,14 @@ def main():
         lo = p.est + pack_cost(p.blind, ms)
         hi = p.est * 0.6 + pack_cost(p.blind | run | slow_if_fail, ms)
         cost_check = (1 - P_FAIL) * lo + P_FAIL * hi
+        p.import_check = bool(res is not None and res.import_risk)
         if not run or cost_blind <= cost_check:
             out[cid] = pack(cands, ms)
             log(cid, f"blind cands={len(cands)} blind_cost={cost_blind:.1f} check_cost={cost_check:.1f}")
+            if p.import_check:
+                # still make sure nothing broke at import time (costs ~0.5 s)
+                p.run, p.blind, p.decided_by, p.keep, p.est = [], set(cands), {}, {}, 0.6
+                plans[cid] = p
             continue
         plans[cid] = p
 
@@ -348,12 +354,21 @@ def main():
             log(p.cid, "blind (budget)")
             continue
         timeout = max(20.0, p.est * 5 + 10)
-        specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout, p.keep))
+        specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout, p.keep, p.import_check))
 
     def final_set(p, failed, passed, done, broken=()):
         fail_nums = {by_id[n] for n in failed if n in by_id}
         extra = set()
         for pre in broken:
+            if pre.startswith("mod:"):
+                # a sqlglot module no longer imports: tests using anything defined in it
+                mod = pre[4:]
+                mpath = mod.replace(".", "/") + ".py"
+                extra |= m.tests_in_file(mpath)
+                for k, v in m.users.items():
+                    if k.startswith(mod + ":"):
+                        extra |= {x for x in v if x in ms}
+                continue
             # a test module / class / the package failed to load: all tests under it fail
             extra |= {n for n, i in by_num.items() if i.startswith(pre)}
         passed_nums = {by_id[n] for n in passed if n in by_id} - fail_nums

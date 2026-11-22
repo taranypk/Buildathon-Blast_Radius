@@ -175,7 +175,7 @@ def _case_filter(orig):
     return wrapper
 
 
-def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
+def _child(overlay: str, nodeids: list[str], wfd: int, keep=None, import_check=False):
     out = os.fdopen(wfd, "w", buffering=1)
 
     def emit(kind, nid):
@@ -197,6 +197,33 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
+
+        if import_check:
+            # does every sqlglot module still import? (import-time code such as templates
+            # parsed in class bodies can break, failing every test module that imports it)
+            import pkgutil
+
+            bad_mods = []
+            import sqlglot as _sg
+
+            for info in pkgutil.walk_packages(_sg.__path__, prefix="sqlglot."):
+                if info.name.endswith("__main__"):
+                    continue
+                try:
+                    importlib.import_module(info.name)
+                except BaseException:  # noqa: BLE001
+                    bad_mods.append(info.name)
+            for name in bad_mods:
+                emit("I", name)
+            if bad_mods:
+                for root, _, fs in os.walk(os.path.join(overlay, "tests")):
+                    for fn in sorted(fs):
+                        if fn.startswith("test_") and fn.endswith(".py"):
+                            rel = os.path.relpath(os.path.join(root, fn), overlay)
+                            try:
+                                importlib.import_module(rel[:-3].replace("/", "."))
+                            except BaseException:  # noqa: BLE001
+                                emit("M", rel)
 
         # group by class, keep file order
         by_class: dict[tuple[str, str], list[str]] = {}
@@ -320,7 +347,7 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
 
 
 class Job:
-    def __init__(self, key, src_root, tmp_root, files, nodeids, timeout, keep=None):
+    def __init__(self, key, src_root, tmp_root, files, nodeids, timeout, keep=None, import_check=False):
         self.key = key
         self.overlay = os.path.join(tmp_root, f"w-{key}")
         shutil.rmtree(self.overlay, ignore_errors=True)
@@ -333,13 +360,14 @@ class Job:
                 os.setpgid(0, 0)
             except Exception:
                 pass
-            _child(self.overlay, nodeids, w, keep)
+            _child(self.overlay, nodeids, w, keep, import_check)
         os.close(w)
         self.pid, self.fd = pid, r
         self.deadline = time.monotonic() + timeout
         self.buf = b""
         self.failed, self.passed, self.proxied = set(), set(), set()
         self.broken = set()  # prefixes of test ids that all fail ("" = everything)
+        self.broken_mods = set()  # sqlglot modules that no longer import
         self.done = False
         self.closed = False
         self.stopped = False
@@ -367,6 +395,8 @@ class Job:
                 print("TIME " + nid, file=sys.stderr)
             elif kind in ("M", "K", "A"):
                 self.broken.add(nid if kind != "A" else "")
+            elif kind == "I":
+                self.broken_mods.add(nid)
             elif kind == "D":
                 self.done = True
 
@@ -401,8 +431,9 @@ def run_jobs(specs, src_root, tmp_root, parallel=2, on_done=None, should_stop=No
             spec = pending.pop(0)
             key, files, nodeids, timeout = spec[:4]
             keep = spec[4] if len(spec) > 4 else None
+            import_check = spec[5] if len(spec) > 5 else False
             try:
-                running.append(Job(key, src_root, tmp_root, files, nodeids, timeout, keep))
+                running.append(Job(key, src_root, tmp_root, files, nodeids, timeout, keep, import_check))
             except Exception as e:  # noqa: BLE001
                 print(f"job {key} failed to start: {e!r}", file=sys.stderr)
                 results[key] = (set(), set(), False, set())
@@ -420,7 +451,7 @@ def run_jobs(specs, src_root, tmp_root, parallel=2, on_done=None, should_stop=No
             if j.closed or time.monotonic() >= j.deadline:
                 j.close()
                 running.remove(j)
-                results[j.key] = (j.failed, j.passed, j.done, j.broken)
+                results[j.key] = (j.failed, j.passed, j.done, j.broken | {"mod:" + x for x in j.broken_mods})
                 print(f"job {j.key} cpu={j.cpu:.2f}", file=sys.stderr)
                 if on_done:
                     on_done(j.key, results[j.key])
