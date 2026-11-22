@@ -28,10 +28,10 @@ WORKER_MS = 2000
 PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor test
 AGGRESSIVE = os.environ.get("BR_AGGRESSIVE", "1") == "1"  # trade some miss risk for time
 E_SAMPLING = os.environ.get("BR_E_SAMPLING", "1" if AGGRESSIVE else "") == "1"
-E_SAMPLE = int(os.environ.get("BR_E_SAMPLE", "10"))  # TPC-DS queries to run when a change can reach many of them
+E_SAMPLE = int(os.environ.get("BR_E_SAMPLE", "4" if AGGRESSIVE else "10"))  # TPC-DS queries to run when a change can reach many of them
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
-CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))  # our CPU seconds per recorded test second
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.8" if AGGRESSIVE else "1.3"))  # our CPU seconds per recorded test second
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # prior that a checked candidate set turns out to fail
 PROXY_COST = {        # CPU seconds of the cheap stand-ins in runner.PROXIES
     "tests/test_parser.py::TestParser::test_max_nodes": 0.4,
@@ -374,7 +374,8 @@ def main():
                     rest = [q for q in m.e_cover if q not in pool]
                     keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
-                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
+                twin_cost = run_s(twin[c]) if AGGRESSIVE and c in twin else (ms[twin[c]] / 1000 if c in twin else 0)
+                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > twin_cost:
                     keep = None  # the optimizer twin is the cheaper check
                 if keep is not None:
                     if not keep:
