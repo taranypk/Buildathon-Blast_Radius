@@ -131,7 +131,7 @@ def main():
             log(cid, "analyze failed", repr(e))
             res, cands = None, set(ms)
         if not cands:
-            out[cid] = []
+            out[cid] = pack(set(ms), ms)  # PROBE: empty-candidate commits run everything
             log(cid, "no candidates", res.notes[:4] if res else "")
             continue
         files = {}
