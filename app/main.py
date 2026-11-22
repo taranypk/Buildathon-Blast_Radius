@@ -95,6 +95,8 @@ def main():
     by_num = {t["number"]: t["id"] for t in tests}
     with gzip.open(MAP, "rt") as f:
         m = analyze.Map(json.load(f))
+    for t in tests:
+        m.tests_by_file.setdefault(t["file"], set()).add(t["number"])
     cdir = os.path.join(DATA, "commits")
     patches = sorted(p for p in os.listdir(cdir) if p.endswith(".patch"))
     n_commits = len(patches)
@@ -188,13 +190,17 @@ def main():
         timeout = max(10.0, p.est * 3 + 8)
         specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout))
 
-    def final_set(p, failed, passed, done):
+    def final_set(p, failed, passed, done, broken=()):
         fail_nums = {by_id[n] for n in failed if n in by_id}
+        extra = set()
+        for pre in broken:
+            # a test module / class / the package failed to load: all tests under it fail
+            extra |= {n for n, i in by_num.items() if i.startswith(pre)}
         passed_nums = {by_id[n] for n in passed if n in by_id} - fail_nums
         if not done:
             # stopped early, crashed or timed out: unchecked tests are scheduled
             fail_nums |= set(p.run) - passed_nums
-        final = (fail_nums & p.cands) | p.blind
+        final = (fail_nums & p.cands) | p.blind | extra
         for slow, tw in p.decided_by.items():
             if tw in fail_nums:
                 final.add(slow)
@@ -213,9 +219,9 @@ def main():
         return (1 - P_FAIL) * delta < rem_cpu
 
     def finish(cid, result):
-        failed, passed, done, proxied = result
+        failed, passed, done, broken = result
         p = plans[cid]
-        final = final_set(p, failed, passed, done)
+        final = final_set(p, failed, passed, done, broken)
         out[cid] = pack(final, ms)
         log(cid, f"run={len(p.run)} est={p.est:.2f}s blind={len(p.blind)} failed={len(failed)} "
                  f"final={len(final)} done={done} t={time.monotonic()-t0:.1f}")

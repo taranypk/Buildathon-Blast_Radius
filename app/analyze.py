@@ -22,8 +22,8 @@ def cls_key_file(key):
     return key.split(":", 1)[0].replace(".", "/") + ".py"
 
 
-def imports_name(m, f, name):
-    tree = m._trees.get(f)
+def imports_name(m, f, name, src_root=None):
+    tree = m.tree(src_root, f) if src_root else m._trees.get(f)
     if tree is None:
         return True
     for n in ast.walk(tree):
@@ -44,6 +44,7 @@ class Map:
         self.class_names = {k.split(":", 1)[1].split(".")[-1] for k in self.mro}
         self._trees = {}
         self._desc = {}
+        self.tests_by_file = {}  # filled by the caller: test file path -> test numbers
 
     def desc_names(self, key):
         """Simple names of `key` and every class that inherits from it."""
@@ -77,6 +78,13 @@ class Map:
         out = set()
         for f, ls in self.reads.get(name, {}).items():
             out |= self.tests_on(f, [l for l, _ in ls])
+        return out
+
+    def readers_in(self, name, files):
+        out = set()
+        for f, ls in self.reads.get(name, {}).items():
+            if f in files:
+                out |= self.tests_on(f, [l for l, _ in ls])
         return out
 
     def static_reads(self, name, skip, cls_key=None, module=None):
@@ -269,15 +277,24 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
         return scope
     if not names:
         res.notes.append(f"module-stmt {path}:{node.lineno}")
-        return m.tests_in_file(path) | _module_users(m, path)
+        return m.tests_in_file(path) | _module_users(m, path) | m.tests_by_file.get(path, set())
     out = set()
+    if path.startswith("tests/") and os.path.basename(path).startswith("test_"):
+        # module level of a test file: every test in it (import errors fail them all)
+        out |= m.tests_by_file.get(path, set())
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        # an import binds names in this module only
+        for n in names:
+            out |= m.readers_in(n, {path})
+        out |= m.tests_in_file(path) | _module_users(m, path)
+        res.notes.append(f"module-import {path}")
+        return out
     for n in names:
-        out |= m.readers(n)
+        files = {f for f in m.reads.get(n, {}) if f == path or imports_name(m, f, n, src_root)}
+        out |= m.readers_in(n, files)
     for n in names:
         for f, l in m.static_reads(n, {(path, node.lineno)}, module=path):
             out |= _static_line(m, src_root, f, l, res, depth, seen)
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        out |= m.tests_in_file(path)
     res.notes.append(f"module-attr {path}:{','.join(sorted(names))}")
     return out
 
@@ -338,6 +355,16 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             continue
         if fd.old is None or old_text is None:
             res.notes.append(f"new py {path}")
+            # tests that scan this directory's files (read them as text)
+            d = os.path.dirname(path) + "/"
+            res.add(t for p, ts in m.opens.items() if p.startswith(d) and "/" not in p[len(d):] for t in ts if t >= 0)
+            if os.path.basename(path) == "conftest.py":
+                res.everything = True
+            continue
+        if fd.new is not None and fd.new != fd.old:
+            # renamed/moved module: anything importing the old name breaks
+            res.notes.append(f"renamed {fd.old} -> {fd.new}")
+            res.everything = True
             continue
         new_text = patchlib.apply(old_text, fd) if fd.new else None
         if new_text is not None and patchlib.same_ast(old_text, new_text):
@@ -353,8 +380,8 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             res.everything = True
             continue
         try:
-            ast.parse(new_text)
-        except SyntaxError:
+            compile(new_text, path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
             res.notes.append(f"syntax-error {path}")
             res.everything = True
             continue

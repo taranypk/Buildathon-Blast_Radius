@@ -172,6 +172,14 @@ def _child(overlay: str, nodeids: list[str], wfd: int):
             path, cls, meth = nid.split("::")
             by_class.setdefault((path, cls), []).append(meth)
 
+        try:
+            import sqlglot  # noqa: F401
+            import sqlglot.dialects  # noqa: F401
+        except BaseException:  # noqa: BLE001
+            emit("A", "")  # the package itself no longer imports: everything fails
+            emit("D", "")
+            return
+
         id_of = {}
         suite = unittest.TestSuite()
         for (path, cls_name), meths in by_class.items():
@@ -180,6 +188,7 @@ def _child(overlay: str, nodeids: list[str], wfd: int):
                 mod = importlib.import_module(modname)
                 cls = getattr(mod, cls_name)
             except BaseException:  # noqa: BLE001
+                emit("M", path)  # the test module does not import: all its tests fail
                 for mth in meths:
                     emit("F", f"{path}::{cls_name}::{mth}")
                 continue
@@ -209,13 +218,15 @@ def _child(overlay: str, nodeids: list[str], wfd: int):
             def _mark(self, test):
                 nid = id_of.get(id(test))
                 if nid is None:
-                    # class/module fixture failure (_ErrorHolder): blame its class
+                    # class/module fixture failure (_ErrorHolder): every test of that class fails
                     desc = str(getattr(test, "description", test))
-                    for k, v in id_of.items():
-                        cls_name = v.split("::")[1]
+                    for v in set(id_of.values()):
+                        path_, cls_name, _ = v.split("::")
                         if cls_name in desc:
-                            self.bad.add(v)
-                            emit("F", v)
+                            emit("K", f"{path_}::{cls_name}")
+                            if v not in self.bad:
+                                self.bad.add(v)
+                                emit("F", v)
                     return
                 if nid not in self.bad:
                     self.bad.add(nid)
@@ -274,6 +285,7 @@ class Job:
         self.deadline = time.monotonic() + timeout
         self.buf = b""
         self.failed, self.passed, self.proxied = set(), set(), set()
+        self.broken = set()  # prefixes of test ids that all fail ("" = everything)
         self.done = False
         self.closed = False
         self.stopped = False
@@ -297,6 +309,8 @@ class Job:
                 self.passed.add(nid)
             elif kind == "X":
                 self.proxied.add(nid)
+            elif kind in ("M", "K", "A"):
+                self.broken.add(nid if kind != "A" else "")
             elif kind == "D":
                 self.done = True
 
@@ -348,7 +362,7 @@ def run_jobs(specs, src_root, tmp_root, parallel=2, on_done=None, should_stop=No
             if j.closed or time.monotonic() >= j.deadline:
                 j.close()
                 running.remove(j)
-                results[j.key] = (j.failed, j.passed, j.done, j.proxied)
+                results[j.key] = (j.failed, j.passed, j.done, j.broken)
                 print(f"job {j.key} cpu={j.cpu:.2f}", file=sys.stderr)
                 if on_done:
                     on_done(j.key, results[j.key])
