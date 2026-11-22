@@ -157,6 +157,50 @@ def changed_old_lines(fd: FileDiff) -> tuple[set[int], set[int]]:
     return removed, border
 
 
+_TOP = ("def ", "class ", "@", "async def ")
+
+
+def _window(a, b):
+    """The top-level definitions around the lines where a and b differ (the rest of the
+    files is identical), so only that part needs tokenizing. None to use whole files."""
+    la, lb = a.split("\n"), b.split("\n")
+    n = min(len(la), len(lb))
+    p = 0
+    while p < n and la[p] == lb[p]:
+        p += 1
+    if p == n and len(la) == len(lb):
+        return "", ""
+    s = 0
+    while s < n - p and la[len(la) - 1 - s] == lb[len(lb) - 1 - s]:
+        s += 1
+    def top(line):
+        st = line.lstrip(" ")
+        return st.startswith(_TOP), len(line) - len(st)
+
+    start = min(p, len(la) - 1)
+    while start > 0 and not top(la[start])[0]:
+        start -= 1
+    while start > 0 and la[start - 1].lstrip(" ").startswith("@"):
+        start -= 1
+    ind = top(la[start])[1] if start > 0 else 0
+    end_a = len(la) - s
+    while end_a < len(la) and not (end_a > p and top(la[end_a])[0] and top(la[end_a])[1] <= ind):
+        end_a += 1
+    end_b = end_a + (len(lb) - len(la))
+    if start == 0 and end_a == len(la):
+        return None
+    return "\n".join(la[start:end_a]) + "\n", "\n".join(lb[start:end_b]) + "\n"
+
+
+def _pair_tokens(a, b):
+    w = _window(a, b)
+    if w is not None:
+        ta, tb = _tokens(w[0]), _tokens(w[1])
+        if ta is not None and tb is not None:
+            return ta, tb
+    return _tokens(a), _tokens(b)
+
+
 def _tokens(text):
     import io
     import tokenize
@@ -189,7 +233,7 @@ def _middle(a, b):
 
 def same_ast(a: str, b: str) -> bool | None:
     """Same code apart from comments and blank lines (token streams equal)."""
-    ta, tb = _tokens(a), _tokens(b)
+    ta, tb = _pair_tokens(a, b)
     if ta is None or tb is None:
         try:
             return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
@@ -222,7 +266,7 @@ SAFE_ENUMS = {
 
 
 def same_ast_modulo_none_compare(a: str, b: str) -> bool:
-    ta, tb = _tokens(a), _tokens(b)
+    ta, tb = _pair_tokens(a, b)
     if ta is not None and tb is not None:
         ma, mb, around = _middle(ta, tb)
         sa, sb = [t[1] for t in ma], [t[1] for t in mb]
