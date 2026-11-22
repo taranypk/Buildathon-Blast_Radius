@@ -253,6 +253,22 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None, import_check=F
                             except BaseException:  # noqa: BLE001
                                 emit("M", rel)
 
+        # duckdb would use every core: one thread gives the same results for less CPU
+        try:
+            import duckdb as _ddb
+
+            _orig_connect = _ddb.connect
+
+            def _connect(*a, **k):
+                cfg = dict(k.get("config") or {})
+                cfg.setdefault("threads", int(os.environ.get("BR_DDB_THREADS", "1")))
+                k["config"] = cfg
+                return _orig_connect(*a, **k)
+
+            _ddb.connect = _connect
+        except Exception:  # noqa: BLE001
+            pass
+
         # group by class, keep file order
         by_class: dict[tuple[str, str], list[str]] = {}
         for nid in nodeids:

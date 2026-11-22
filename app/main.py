@@ -29,7 +29,7 @@ PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor t
 E_SAMPLE = int(os.environ.get("BR_E_SAMPLE", "10"))  # TPC-DS queries to run when a change can reach many of them
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
-CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.1"))  # our CPU seconds per recorded test second
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.5"))  # our CPU seconds per recorded test second
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # prior that a checked candidate set turns out to fail
 PROXY_COST = {        # CPU seconds of the cheap stand-ins in runner.PROXIES
     "tests/test_parser.py::TestParser::test_max_nodes": 0.4,
@@ -369,7 +369,7 @@ def main():
                     rest = [q for q in m.e_cover if q not in pool]
                     keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
-                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > run_s(twin[c]):
+                if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
                     keep = None  # the optimizer twin is the cheaper check
                 if keep is not None:
                     if not keep:
@@ -393,12 +393,18 @@ def main():
             groups.setdefault(cls_of(c), []).append(c)
         # slow tests with a cheap check go first, so stopping early after a failure never
         # leaves them unchecked (which would schedule them in full)
+        twins_of = set(p.decided_by.values())
+
         def slow_first(c):
+            if c in twins_of:
+                return 0  # decides a slow test
             return 0 if ms[c] >= 2000 and eff(c, p) * CPU_FACTOR + 1.0 < ms[c] / 1000 else 1
 
         order = sorted(groups.values(), key=lambda g: (min(slow_first(c) for c in g), min(eff(c, p) for c in g) + CLASS_SETUP.get(cls_of(g[0]), 0)))
         p.run = [c for g in order for c in sorted(g, key=lambda c: (slow_first(c), eff(c, p), c))]
         p.est = est_cpu(run, p)
+        if os.environ.get("BR_DBG"):
+            log(cid, "order", [by_num[c].split("::")[-1] for c in p.run[:5]], {by_num[k]: by_num[v] for k, v in p.decided_by.items()}, list(p.keep)[:3])
         # schedule everything blind when that is expected to be cheaper than checking
         cost_blind = pack_cost(cands, ms)
         slow_if_fail = set(p.decided_by)

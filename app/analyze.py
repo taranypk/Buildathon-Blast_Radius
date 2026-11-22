@@ -316,13 +316,21 @@ class Map:
                 keep |= set(cl[str(l)])
         return {names[i] for i in keep}
 
-    def generic_static_read(self, name):
-        """Is `name` read at import time through self/cls (a metaclass deriving other data)?"""
+    def generic_static_read(self, name, cls_key=None):
+        """Is `name` read at import time through self/cls (a metaclass deriving other data)?
+        With cls_key (the class whose attribute changed), reads through an instance
+        (`self...`) only count if some instance made at import time is of that class."""
+        inst_ok = None
         for f, ls in self.reads.get(name, {}).items():
             st = self.static.get(f, set())
             lam = self.lambda_reads.get(name, {}).get(f, ())
             for l, base in ls:
                 if l in st and l not in lam and base.split(".")[0] in GENERIC:
+                    if cls_key is not None and base.split(".")[0] in ("self", "this"):
+                        if inst_ok is None:
+                            inst_ok = any(cls_key in self.mro.get(k, (k,)) for k in self.import_classes)
+                        if not inst_ok:
+                            continue
                     return True
         return False
 
@@ -700,11 +708,11 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
         readers = set()
         for n in names:
             readers |= m.readers(n)
-        if stat or any(m.generic_static_read(n) for n in names):
+        if stat or any(m.generic_static_read(n, q) for n in names):
             # the value feeds other import-time code (metaclass, subclass dicts)
             res.notes.append(f"class-attr-derived {q}.{','.join(sorted(names))}")
             out = set(scope) if tracked else set(scope) | readers
-            if any(m.generic_static_read(n) for n in names):
+            if any(m.generic_static_read(n, q) for n in names):
                 # metaclass code copies it onto this class and the class that encloses it
                 # (a dialect's nested Tokenizer feeds the dialect's own settings)
                 out |= _owner_users(m, q)
@@ -904,7 +912,7 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                     names = assigned_names(node)
                     risky = bool(
                         (q and any(q in m.mro.get(k, (k,)) for k in m.import_classes))
-                        or any(m.static_reads(n, {(path, node.lineno)}) or m.generic_static_read(n) for n in names)
+                        or any(m.static_reads(n, {(path, node.lineno)}) or m.generic_static_read(n, q) for n in names)
                         or not names
                     )
                 res.import_risk = risky
@@ -972,7 +980,8 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
         except SyntaxError:
             new_tree = None
         if new_tree is not None:
-            for line in sorted(patchlib.added_new_lines(fd)):
+            added_lines = patchlib.added_new_lines(fd)
+            for line in sorted(added_lines):
                 hit = innermost(new_tree, line)
                 if hit is None:
                     continue
@@ -981,6 +990,11 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                     continue
                 lo, hi = header_range(node)
                 if not (lo <= line <= hi):
+                    continue
+                lam = enclosing_lambda(node, line)
+                if lam is not None and line > lam.lineno and lam.lineno not in added_lines:
+                    # the body of a lambda that was already there: the old lambda's tests
+                    # (handled with the removed lines) are the ones that run it
                     continue
                 env_eff = env_entry_effect(m, path, node, line, new_lines, new_lines, added=True)
                 if env_eff is not None:
