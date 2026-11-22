@@ -97,6 +97,26 @@ EXEC_FIXTURES = {
 }
 
 
+def fixture_lines(text):
+    """tests/helpers.py load_sql_fixtures, on text."""
+    out, lines = [], []
+    for line in "\n".join(l for l in text.splitlines() if l and not l.startswith("--")).splitlines():
+        lines.append(line)
+        if not line.startswith("#"):
+            out.append("\n".join(lines))
+            lines.clear()
+    return out
+
+
+def fixture_case_changes(old_text, new_text):
+    """Indices of fixture cases that differ (under either loader), or None if unsure."""
+    a, b = fixture_pairs(old_text or ""), fixture_pairs(new_text or "")
+    c, d = fixture_lines(old_text or ""), fixture_lines(new_text or "")
+    if a is None or b is None or len(a) != len(b) or len(c) != len(d):
+        return None
+    return {i for i, (x, y) in enumerate(zip(a, b)) if x != y} | {i for i, (x, y) in enumerate(zip(c, d)) if x != y}
+
+
 def exec_fixture_queries(path, old_text, new_text):
     """Indices of entries whose meta or query text changed (None: the file's shape changed)."""
     a, b = fixture_pairs(old_text or ""), fixture_pairs(new_text or "")
@@ -146,10 +166,24 @@ def main():
     proxy_cost = {by_id[k]: v for k, v in PROXY_COST.items() if k in by_id}
 
     subq_tests = {by_id[k] for k in m.subq if k in by_id}
+    casemap_box = {}
+
+    def casemap():
+        if "m" not in casemap_box:
+            try:
+                with gzip.open(os.path.join(HERE, "casemap.json.gz"), "rt") as fh:
+                    casemap_box["m"] = json.load(fh)
+            except Exception:  # noqa: BLE001
+                casemap_box["m"] = {}
+        return casemap_box["m"]
+
 
     def eff(n, p=None):
         if p is not None and by_num[n] in p.keep:
-            return 1.4 + 0.5 * len(p.keep[by_num[n]])
+            k = p.keep[by_num[n]]
+            if isinstance(k, dict):
+                return 0.05 + ms[n] / 1000 * k["frac"]
+            return 1.4 + 0.5 * len(k)
         return proxy_cost.get(n, ms[n] / 1000)
 
     def cls_of(n):
@@ -219,10 +253,29 @@ def main():
                     elif tid in m.subq:
                         p.keep[tid] = sorted(changed)
                         only_fixture_reason[by_id[tid]] = True
+        fixture_changes = {}
+        for fpath, ftext in files.items():
+            if fpath.startswith("tests/fixtures/") and fpath.endswith(".sql"):
+                old_f = os.path.join(SRC, fpath)
+                old_t = open(old_f, encoding="utf-8").read() if os.path.exists(old_f) else None
+                fixture_changes[fpath] = fixture_case_changes(old_t, ftext) if old_t is not None and ftext is not None else None
         for c in list(cands):
             if c in only_fixture_reason:
                 run.add(c)
                 continue
+            if res is not None and ms[c] >= 150 and c not in subq_tests:
+                cm = casemap()
+                if by_num[c] in cm:
+                    kept = m.case_subset(cm, by_num[c], res, c, fixture_changes)
+                    if kept is not None:
+                        if not kept:
+                            cands.discard(c)
+                            p.cands.discard(c)
+                            continue
+                        n_all = max(1, len(cm[by_num[c]]["cases"]))
+                        p.keep[by_num[c]] = {"cases": sorted(kept), "frac": len(kept) / n_all}
+                        run.add(c)
+                        continue
             if c in subq_tests and res is not None and c not in run:
                 keep = m.query_subset(by_num[c], res, c)
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)

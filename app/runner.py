@@ -158,6 +158,23 @@ def _filtered_mp_execute(mod, keep):
     return _mp_execute
 
 
+_CASES = {"nid": None, "keep": {}}
+
+
+def _case_filter(orig):
+    """load_sql_fixture_pairs / load_sql_fixtures that yield only the kept cases of the
+    current test (same indices as the full file)."""
+
+    def wrapper(filename, *a, **k):
+        keep = _CASES["keep"].get(_CASES["nid"])
+        for i, item in enumerate(orig(filename, *a, **k)):
+            if keep is None or f"{filename}:{i}" in keep:
+                yield item
+
+    wrapper.__wrapped__ = orig
+    return wrapper
+
+
 def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
     out = os.fdopen(wfd, "w", buffering=1)
 
@@ -207,9 +224,19 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
                 for mth in meths:
                     emit("F", f"{path}::{cls_name}::{mth}")
                 continue
+            if keep and any(f"{path}::{cls_name}::{mth}" in keep and isinstance(keep[f"{path}::{cls_name}::{mth}"], dict) for mth in meths):
+                for fn in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+                    if hasattr(mod, fn) and not hasattr(getattr(mod, fn), "__wrapped__"):
+                        setattr(mod, fn, _case_filter(getattr(mod, fn)))
             for mth in meths:
                 nid = f"{path}::{cls_name}::{mth}"
-                if keep and nid in keep:
+                if keep and isinstance(keep.get(nid), dict):
+                    _CASES["keep"][nid] = set(keep[nid]["cases"])
+                    emit("X", nid)
+                    nid_is_case = True
+                else:
+                    nid_is_case = False
+                if keep and nid in keep and not nid_is_case:
                     try:
                         setattr(cls, "_mp_execute", _filtered_mp_execute(mod, set(keep[nid])))
                         emit("X", nid)
@@ -266,8 +293,14 @@ def _child(overlay: str, nodeids: list[str], wfd: int, keep=None):
             def addUnexpectedSuccess(self, test):
                 self._mark(test)
 
+            def startTest(self, test):
+                self._t0 = time.process_time()
+                _CASES["nid"] = id_of.get(id(test))
+
             def stopTest(self, test):
                 nid = id_of.get(id(test))
+                if nid is not None and os.environ.get("BR_TIMING"):
+                    emit("T", f"{nid}|{time.process_time() - self._t0:.3f}")
                 if nid is not None and nid not in self.bad:
                     emit("P", nid)
 
@@ -330,6 +363,8 @@ class Job:
                 self.passed.add(nid)
             elif kind == "X":
                 self.proxied.add(nid)
+            elif kind == "T":
+                print("TIME " + nid, file=sys.stderr)
             elif kind in ("M", "K", "A"):
                 self.broken.add(nid if kind != "A" else "")
             elif kind == "D":

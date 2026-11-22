@@ -240,6 +240,38 @@ class Map:
                     break
         return out
 
+    def case_subset(self, casemap, test_id, res, num, fixture_changes):
+        """Fixture cases of a per-case-mapped test that a change can reach, or None when the
+        change can reach the test outside its case loop (then run the whole test)."""
+        cm = casemap.get(test_id)
+        if not cm:
+            return None
+        names = cm["cases"]
+        keep = set()
+        for s, where in zip(res.reasons, res.where):
+            if num not in s:
+                continue
+            if where is None:
+                return None
+            if where[0] == "open":
+                fx = where[1]
+                rel = fx[len("tests/fixtures/"):] if fx.startswith("tests/fixtures/") else None
+                changed = fixture_changes.get(fx)
+                if rel is None or changed is None:
+                    return None
+                keep |= {i for i, n in enumerate(names) if n.rsplit(":", 1)[0] == rel and int(n.rsplit(":", 1)[1]) in changed}
+                continue
+            path, lines = where
+            cl = cm["c"].get(path, {})
+            outside = set(cm["outside"].get(path, []))
+            for l in lines:
+                if num not in self.lines.get(path, {}).get(l, ()):
+                    continue
+                if l in outside or str(l) not in cl:
+                    return None
+                keep |= set(cl[str(l)])
+        return {names[i] for i in keep}
+
     def generic_static_read(self, name):
         """Is `name` read at import time through self/cls (a metaclass deriving other data)?"""
         for f, ls in self.reads.get(name, {}).items():
@@ -588,7 +620,7 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 old_text = open(p, encoding="utf-8", errors="surrogateescape").read()
         for p in {fd.old, fd.new} - {None}:
             openers = m.opens.get(p, ())
-            res.add(t for t in openers if t >= 0)
+            res.add((t for t in openers if t >= 0), where=("open", p))
             if -1 in openers:
                 res.notes.append(f"collect-opens {p}")
         if not path.endswith(".py"):
