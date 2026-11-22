@@ -33,7 +33,7 @@ CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.1"))  # our CPU seconds pe
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # prior that a checked candidate set turns out to fail
 PROXY_COST = {        # CPU seconds of the cheap stand-ins in runner.PROXIES
     "tests/test_parser.py::TestParser::test_max_nodes": 0.4,
-    "tests/test_generator.py::TestGenerator::test_generator_memory": 2.7,
+    "tests/test_generator.py::TestGenerator::test_generator_memory": 0.9,
 }
 CLASS_SETUP = {"tests/test_executor.py::TestExecutor": 1.4}
 

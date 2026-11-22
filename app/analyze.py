@@ -441,6 +441,42 @@ def entry_keys(node, line, old_lines, new_lines):
     return {k.lower() for k in lits}
 
 
+def escape_keys(node, line, old_lines, new_lines):
+    """A one-line NUMERIC_ESCAPES table whose entries keep their keys but change a value:
+    only SQL text with that backslash escape (`\\u`, or `\\0`-`\\7` for octal) is read
+    differently. Returns the escape strings to look for, or None."""
+    import re
+
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.lineno != line:
+        return None
+    if getattr(node, "end_lineno", line) != line:
+        return None
+    tgt = node.targets[0] if isinstance(node, ast.Assign) else node.target
+    if not isinstance(tgt, ast.Name) or tgt.id != "NUMERIC_ESCAPES":
+        return None
+    pat = r"[\"']([^\"'\\]+)[\"']\s*:\s*(\([^()]*\))"
+    ol = [x for x in old_lines if x.strip().startswith("NUMERIC_ESCAPES")]
+    nl = [x for x in new_lines if x.strip().startswith("NUMERIC_ESCAPES")]
+    if len(nl) != 1 or len(ol) != 1:
+        return None
+    o = dict(re.findall(pat, ol[0]))
+    if not o:
+        return None
+    n = dict(re.findall(pat, nl[0]))
+    if set(o) != set(n) or o == n:
+        return None
+    changed = [k for k in o if o[k] != n[k]]
+    if any(len(k) != 1 for k in changed):
+        return None
+    out = set()
+    for k in changed:
+        if k == "0":
+            out |= {"\\" + str(d) for d in range(8)}
+        else:
+            out.add(("\\" + k).lower())
+    return out
+
+
 def sql_keyed(m, path, chain):
     """Is this statement in a tokenizer or parser class (whose tables are keyed by SQL text)?"""
     classes = [c for c in chain if isinstance(c, ast.ClassDef)]
@@ -818,7 +854,13 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 direct_lines = {line}
             else:
                 direct_lines = set(range(lo, hi + 1))
-            res.add(m.tests_on(path, direct_lines), where=(path, direct_lines))
+            esc = escape_keys(node, line, old_lines, new_lines) if not in_func and sql_keyed(m, path, chain) else None
+            direct = m.tests_on(path, direct_lines)
+            if esc and m.id_of:
+                kept = m.key_filter(src_root, direct, esc)
+                res.notes.append(f"escape-filter {sorted(esc)[:3]} {len(direct)}->{len(kept)}")
+                direct = kept
+            res.add(direct, where=(path, direct_lines))
             if (
                 path == "sqlglot/dialects/__init__.py"
                 or (path == "sqlglot/__init__.py" and not any(isinstance(c, FUNC) for c in chain[1:]))
@@ -842,6 +884,8 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 res.notes.append(f"exp-key {sorted(ek)[:3]} {len(eff)}->{len(kept)}")
                 eff = kept
             keys = entry_keys(node, line, old_lines, new_lines) if sql_keyed(m, path, chain) else None
+            if keys is None and sql_keyed(m, path, chain):
+                keys = escape_keys(node, line, old_lines, new_lines)
             if keys and m.id_of:
                 kept = m.key_filter(src_root, eff, keys)
                 res.notes.append(f"key-filter {sorted(keys)[:3]} {len(eff)}->{len(kept)}")
@@ -875,6 +919,8 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 if ek:
                     eff = eff & m.exp_users(ek)
                 keys = entry_keys(node, line, new_lines, new_lines) if sql_keyed(m, path, chain) else None
+                if keys is None and sql_keyed(m, path, chain):
+                    keys = escape_keys(node, line, old_lines, new_lines)
                 if keys and m.id_of:
                     eff = m.key_filter(src_root, eff, keys)
                 res.add(eff)

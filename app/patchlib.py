@@ -215,6 +215,12 @@ class _NoneCompare(ast.NodeTransformer):
         return node
 
 
+SAFE_ENUMS = {
+    "AliasPrecedence", "DType", "ErrorLevel", "IsPredicatePrecedence", "NormalizationStrategy",
+    "PropertiesLocation", "ScopeType", "TokenType", "TrieResult", "UsingColumnOrder",
+}
+
+
 def same_ast_modulo_none_compare(a: str, b: str) -> bool:
     ta, tb = _tokens(a), _tokens(b)
     if ta is not None and tb is not None:
@@ -223,7 +229,22 @@ def same_ast_modulo_none_compare(a: str, b: str) -> bool:
         pairs = {(("is",), ("==",)), (("==",), ("is",)), (("is", "not"), ("!=",)), (("!=",), ("is", "not"))}
         if (tuple(sa), tuple(sb)) in pairs:
             # the operator sits right next to the differing span: is a None on either side?
-            return any(t[1] == "None" for t in around)
+            if any(t[1] == "None" for t in around):
+                return True
+            # ... or a member of one of sqlglot's enums (identity and equality agree for
+            # enum members; Dialects is left out, its values are often given as strings)
+            k = 0
+            while k < min(len(ta), len(tb)) and ta[k] == tb[k]:
+                k += 1
+            after = [t[1] for t in ta[k + len(ma) : k + len(ma) + 4]]
+            before = [t[1] for t in ta[max(0, k - 4) : k]]
+            if len(after) >= 3 and after[0] in SAFE_ENUMS and after[1] == "." and after[2].isupper() \
+                    and (len(after) < 4 or after[3] not in (".", "(", "[")):
+                return True
+            if len(before) >= 3 and before[-3] in SAFE_ENUMS and before[-2] == "." and before[-1].isupper() \
+                    and (len(before) < 4 or before[-4] != "."):
+                return True
+            return False
         if len(ma) + len(mb) < 40:
             return False  # a small, different change
     try:
