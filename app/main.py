@@ -29,7 +29,7 @@ PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor t
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))  # our CPU seconds per recorded test second
-P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # prior that a checked candidate set turns out to fail
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.35"))  # prior that a checked candidate set turns out to fail
 PROXY_COST = {        # CPU seconds of the cheap stand-ins in runner.PROXIES
     "tests/test_parser.py::TestParser::test_max_nodes": 0.4,
     "tests/test_generator.py::TestGenerator::test_generator_memory": 2.7,
