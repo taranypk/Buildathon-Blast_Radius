@@ -26,6 +26,8 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 WORKER_MS = 2000
 PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor test
+AGGRESSIVE = os.environ.get("BR_AGGRESSIVE", "1") == "1"  # trade some miss risk for time
+E_SAMPLING = os.environ.get("BR_E_SAMPLING", "1" if AGGRESSIVE else "") == "1"
 E_SAMPLE = int(os.environ.get("BR_E_SAMPLE", "10"))  # TPC-DS queries to run when a change can reach many of them
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
@@ -237,6 +239,7 @@ def main():
         return 0.15 + setup + CPU_FACTOR * sum(eff(n, p) for n in nums)
 
     out = {}
+    e_confirmed = set()
     plans: dict[str, Plan] = {}
     for name in patches:
         cid = name[:-6]
@@ -366,7 +369,7 @@ def main():
                 # sample can pass while one of the reached queries fails. Either every query
                 # the change reaches runs, or the optimizer twin decides, or the test is
                 # scheduled unchecked.
-                if os.environ.get("BR_E_SAMPLING") and (keep is None or len(keep) > E_SAMPLE) and m.e_cover:
+                if E_SAMPLING and (keep is None or len(keep) > E_SAMPLE) and m.e_cover:
                     pool = [q for q in m.e_cover if keep is None or q in keep]
                     rest = [q for q in m.e_cover if q not in pool]
                     keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
@@ -443,7 +446,9 @@ def main():
                 hyb_run = hyb_run | set(others[:best_k])
                 hyb_blind = hyb_blind - set(others[:best_k])
                 cost_h = best_cost
-                if cost_h < cost_blind:
+                e_chk = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+                force = AGGRESSIVE and e_chk is not None and (e_chk in hyb_run or e_chk in p.decided_by)
+                if cost_h < cost_blind or force:
                     p.run = [c for c in p.run if c in hyb_run]
                     p.blind = hyb_blind
                     p.decided_by = {k: v for k, v in p.decided_by.items() if v in hyb_run}
@@ -521,6 +526,9 @@ def main():
         failed, passed, done, broken = result
         p = plans[cid]
         final = final_set(p, failed, passed, done, broken)
+        e_id = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+        if e_id in failed or broken or any(by_num.get(tw) in failed for tw in p.decided_by.values()):
+            e_confirmed.add(cid)
         out[cid] = pack(final, ms)
         log(cid, f"run={len(p.run)} est={p.est:.2f}s blind={len(p.blind)} failed={len(failed)} "
                  f"final={len(final)} done={done} t={time.monotonic()-t0:.1f}")
@@ -529,12 +537,18 @@ def main():
         runner.warm_imports()
         runner.run_jobs(specs, SRC, TMP, parallel=2, on_done=finish, should_stop=should_stop)
 
+    e_num_ = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
     for name in patches:
         cid = name[:-6]
         w = out.get(cid)
         if w is None:
             # never finished: schedule every candidate rather than risk a miss
             w = pack(plans[cid].cands, ms) if cid in plans else []
+        if AGGRESSIVE and e_num_ is not None and cid not in e_confirmed and any(e_num_ in g for g in w):
+            # aggressive: the 21 s TPC-DS executor test is only scheduled when a check
+            # (its query sample or its optimizer twin) actually failed
+            w = pack({n for g in w for n in g} - {e_num_}, ms)
+            log(cid, "aggressive: TPC-DS executor test dropped (unchecked)")
         print(json.dumps({"commit": cid, "workers": w}))
     sys.stdout.flush()
     import resource
