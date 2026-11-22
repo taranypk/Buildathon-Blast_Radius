@@ -101,6 +101,26 @@ if os.path.exists(q2):
         for k in keys:
             users[k].add(PSEUDO_BASE + int(i))
 
+# executor ENV functions called by each test / TPC-DS query
+env_usage = {"tests": {}, "queries": {}, "callables": []}
+try:
+    import importlib, sys as _sys
+    _sys.path.insert(0, root)
+    _envmod = importlib.import_module("sqlglot.executor.env")
+    env_usage["callables"] = sorted(k for k, v in _envmod.ENV.items() if callable(v) and not isinstance(v, type(_sys)))
+except Exception as e:
+    print("env callables unavailable", e)
+eu = "/home/claude/br/covq2/envusage.json"
+if os.path.exists(eu):
+    d_env = json.load(open(eu))
+    for t, keys in d_env["tests"].items():
+        if t in num:
+            for k in keys:
+                env_usage["tests"].setdefault(k, []).append(num[t])
+    for q, keys in d_env["queries"].items():
+        for k in keys:
+            env_usage["queries"].setdefault(k, []).append(int(q))
+
 # names assigned at class/module level anywhere, and where they are read
 assigned = set()
 trees = {}
@@ -178,6 +198,7 @@ for t in tests:
                 tranges[str(t["number"])] = [meth_rng, other]
 subq = json.load(open("/home/claude/br/covq/subq_map.json")) if os.path.exists("/home/claude/br/covq/subq_map.json") else {}
 res = {
+    "env_usage": env_usage,
     "tranges": tranges,
     "subq": subq,
     "lines": {f: {str(l): sorted(s) for l, s in dd.items()} for f, dd in lines.items()},

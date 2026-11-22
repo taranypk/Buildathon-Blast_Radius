@@ -53,6 +53,7 @@ class Map:
         self.users = {k: set(v) for k, v in data.get("users", {}).items()}
         self.reads = data.get("reads", {})
         self.subq = data.get("subq", {})
+        self.env_usage = data.get("env_usage", {})
         self.mro = data.get("mro", {})
         self.class_names = {k.split(":", 1)[1].split(".")[-1] for k in self.mro}
         self._trees = {}
@@ -461,6 +462,33 @@ def exp_keys(node, line, lines_):
     return set(keys)
 
 
+def env_entry_effect(m, path, node, line, old_lines, new_lines):
+    """Tests and TPC-DS queries (pseudo-tests) calling the ENV function on a changed entry
+    line of sqlglot/executor/env.py's ENV table; None when the rule does not apply."""
+    import re
+
+    if path != "sqlglot/executor/env.py" or not m.env_usage:
+        return None
+    if not isinstance(node, ast.Assign) or not any(isinstance(t, ast.Name) and t.id == "ENV" for t in node.targets):
+        return None
+    if line <= node.lineno:
+        return None
+    keys = set()
+    for text in (old_lines[line - 1] if line - 1 < len(old_lines) else "", new_lines[line - 1] if line - 1 < len(new_lines) else ""):
+        mt = re.match(r'\s*["\']([^"\']+)["\']\s*:', text)
+        if not mt:
+            return None
+        keys.add(mt.group(1))
+    callables = set(m.env_usage.get("callables", ()))
+    if not keys or not keys <= callables:
+        return None  # not a plain function entry (e.g. the `exp` module): no usage record
+    out = set()
+    for k in keys:
+        out |= set(m.env_usage.get("tests", {}).get(k, ()))
+        out |= {100000 + q for q in m.env_usage.get("queries", {}).get(k, ())}
+    return out
+
+
 def enclosing_lambda(node, line):
     """Innermost lambda inside `node` whose span contains `line`."""
     best = None
@@ -743,7 +771,20 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 res.add(m.tests_on(path, lines_l), where=(path, lines_l))
                 res.notes.append(f"lambda-body {path}:{line}")
                 continue
-            res.add(m.tests_on(path, range(lo, hi + 1)), where=(path, set(range(lo, hi + 1))))
+            in_func = any(isinstance(c, FUNC) for c in chain[1:])
+            env_eff0 = None if in_func else env_entry_effect(m, path, node, line, old_lines, new_lines)
+            if env_eff0 is not None:
+                # an executor ENV entry: only the tests / TPC-DS queries that call it
+                res.add(env_eff0)
+                res.notes.append(f"env-entry {len(env_eff0)}")
+                continue
+            if not in_func and isinstance(node, (ast.Assign, ast.AnnAssign)) and hi > lo:
+                # one entry of a multi-line import-time table: its own runtime code only
+                # (the import-time effect of the whole statement is handled below)
+                direct_lines = {line}
+            else:
+                direct_lines = set(range(lo, hi + 1))
+            res.add(m.tests_on(path, direct_lines), where=(path, direct_lines))
             if (
                 path == "sqlglot/dialects/__init__.py"
                 or (path == "sqlglot/__init__.py" and not any(isinstance(c, FUNC) for c in chain[1:]))
@@ -751,7 +792,6 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             ):
                 res.no_check = True
                 res.notes.append(f"global-state {path}")
-            in_func = any(isinstance(c, FUNC) for c in chain[1:])
             if in_func:
                 if m.static.get(path, set()) & set(range(lo, hi + 1)):
                     # function code that runs at import time (metaclass, factory called
@@ -791,6 +831,10 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                     continue
                 lo, hi = header_range(node)
                 if not (lo <= line <= hi):
+                    continue
+                env_eff = env_entry_effect(m, path, node, line, new_lines, new_lines)
+                if env_eff is not None:
+                    res.add(env_eff)
                     continue
                 eff = static_effect(m, src_root, path, node, chain, res, seen={("new", path, node.lineno)})
                 ek = exp_keys(node, line, new_lines)

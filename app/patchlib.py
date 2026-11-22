@@ -136,19 +136,23 @@ def changed_old_lines(fd: FileDiff) -> tuple[set[int], set[int]]:
     for h in fd.hunks:
         ln = h[0] if any(t in (" ", "-") for t, *_ in h[1]) else h[0] + 1
         prev_kind = None
+        replaced = False  # the current +block replaces removed lines
         for item in h[1]:
             tag = item[0]
             if tag == " ":
-                if prev_kind == "+":
+                if prev_kind == "+" and not replaced:
                     border.add(ln)
                 ln += 1
+                replaced = False
             elif tag == "-":
                 removed.add(ln)
                 ln += 1
+                replaced = True
             else:
-                if prev_kind != "+":
-                    border.add(ln - 1)  # line before the insertion
-                    border.add(ln)  # line after (if any)
+                if prev_kind != "+" and not replaced:
+                    # a pure insertion: the statements on either side locate it
+                    border.add(ln - 1)
+                    border.add(ln)
             prev_kind = tag
     return removed, border
 
