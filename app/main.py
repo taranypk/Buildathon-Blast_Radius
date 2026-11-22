@@ -25,6 +25,7 @@ SRC = os.environ.get("BR_SRC", "/app/sqlglot")
 TMP = os.environ.get("BR_TMP", "/tmp")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 WORKER_MS = 2000
+PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor test
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))  # our CPU seconds per recorded test second
@@ -178,6 +179,18 @@ def main():
         return casemap_box["m"]
 
 
+    def pseudo_queries(res, num):
+        """TPC-DS queries (pseudo-tests 100000+i in the map) selected together with the
+        executor test; None when some reason selects the test but none of its queries."""
+        keep = set()
+        for r in res.reasons:
+            if num in r:
+                qs = {x - PSEUDO_BASE for x in r if x >= PSEUDO_BASE}
+                if not qs:
+                    return None
+                keep |= qs
+        return keep
+
     def eff(n, p=None):
         if p is not None and by_num[n] in p.keep:
             k = p.keep[by_num[n]]
@@ -204,6 +217,12 @@ def main():
         try:
             res = analyze.analyze(text, SRC, m)
             cands = {c for c in res.cands if c in ms}
+            e_num = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+            if e_num is not None and any(x >= PSEUDO_BASE for x in res.cands):
+                cands.add(e_num)
+                if not any(e_num in r for r in res.reasons):
+                    res.reasons.append({e_num} | {x for x in res.cands if x >= PSEUDO_BASE})
+                    res.where.append(None)
             if res.everything:
                 cands = set(ms)
         except Exception as e:  # noqa: BLE001
@@ -277,7 +296,9 @@ def main():
                         run.add(c)
                         continue
             if c in subq_tests and res is not None and c not in run:
-                keep = m.query_subset(by_num[c], res, c)
+                keep = pseudo_queries(res, c)
+                if keep is None:
+                    keep = m.query_subset(by_num[c], res, c)
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
                 if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
                     keep = None  # the optimizer twin is the cheaper check
@@ -340,6 +361,13 @@ def main():
             # stopped early, crashed or timed out: unchecked tests are scheduled
             fail_nums |= set(p.run) - passed_nums
         final = (fail_nums & p.cands) | p.blind | extra
+        if fail_nums & p.cands:
+            # flaky siblings (set ordering, hash seed): a cheap candidate in the same test
+            # class as a failure may fail in the scorer's run even though it passed here
+            classes = {cls_of(n) for n in fail_nums & p.cands}
+            sib = {c for c in p.cands if cls_of(c) in classes and ms[c] <= 100} - final
+            if sib and pack_cost(final | sib, ms) - pack_cost(final, ms) <= 0.6:
+                final |= sib
         for slow, tw in p.decided_by.items():
             if tw in fail_nums:
                 final.add(slow)

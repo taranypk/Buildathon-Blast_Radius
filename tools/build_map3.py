@@ -62,6 +62,45 @@ for f in glob.glob(os.path.join(covdir, "*", "classes-*.json")):
             for b in mro.get(k, [k]):
                 users[b].add(num[t])
 
+# TPC-DS executor queries as pseudo-tests (number 100000 + query index): their own
+# lines and class users, so every selection rule also decides which queries to run
+_fbl = {}
+
+
+def func_body_lines(rel):
+    """Lines inside function bodies (code that runs when called, not at import)."""
+    if rel not in _fbl:
+        out = set()
+        try:
+            tree = ast.parse(open(os.path.join(root, rel), encoding="utf-8").read())
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    body = n.body if isinstance(n.body, list) else [n.body]
+                    for b in body:
+                        out.update(range(b.lineno, (b.end_lineno or b.lineno) + 1))
+        except Exception:
+            pass
+        _fbl[rel] = out
+    return _fbl[rel]
+
+
+PSEUDO_BASE = 100000
+E_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+q2 = os.path.join("/home/claude/br/covq2", ".coverage")
+if os.path.exists(q2):
+    dq = CoverageData(q2); dq.read()
+    for f in dq.measured_files():
+        rel = os.path.relpath(f, root)
+        for ln, ctxs in dq.contexts_by_lineno(f).items():
+            for c in ctxs:
+                if c.startswith(E_ID + "|q") and ln in func_body_lines(rel):
+                    # import-time lines (a dialect first imported during this query) are
+                    # handled by the class-user rules, not by line coverage
+                    lines[rel][ln].add(PSEUDO_BASE + int(c.rsplit("|q", 1)[1]))
+    for i, keys in json.load(open("/home/claude/br/covq2/qusers.json")).items():
+        for k in keys:
+            users[k].add(PSEUDO_BASE + int(i))
+
 # names assigned at class/module level anywhere, and where they are read
 assigned = set()
 trees = {}

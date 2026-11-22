@@ -66,6 +66,7 @@ class Map:
         self._flines = {}
         self._fixture_text = {}
         self._opened_by = None
+        self._qtext = None
         self.by_simple = {}
         for k in self.users:
             self.by_simple.setdefault(k.split(":", 1)[1].split(".")[-1], []).append(k)
@@ -219,10 +220,28 @@ class Map:
                         self._opened_by.setdefault(t, []).append(p)
         return self._opened_by
 
+    def pseudo_text(self, src_root, i):
+        """SQL text of TPC-DS query i (pseudo-test 100000+i), lower-cased."""
+        if self._qtext is None:
+            self._qtext = {}
+            try:
+                text = open(os.path.join(src_root, "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"), encoding="utf-8").read()
+                stmts = "\n".join(l for l in text.splitlines() if l and not l.startswith("--")).split(";")
+                for k in range(0, len(stmts) - 1, 2):
+                    self._qtext[k // 2] = stmts[k].lower()
+            except Exception:  # noqa: BLE001
+                pass
+        return self._qtext.get(i)
+
     def key_filter(self, src_root, tests, keys):
         out = set()
         hit = {}
         for t in tests:
+            if t >= 100000:
+                q = self.pseudo_text(src_root, t - 100000)
+                if q is None or any(k in q for k in keys):
+                    out.add(t)
+                continue
             tt = self.test_text(src_root, t)
             if tt is None:
                 out.add(t)
