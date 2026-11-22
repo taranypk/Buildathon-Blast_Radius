@@ -54,6 +54,9 @@ class Map:
         self.reads = data.get("reads", {})
         self.subq = data.get("subq", {})
         self.env_usage = data.get("env_usage", {})
+        self.import_classes = set(data.get("import_classes", ()))
+        # TPC-DS queries ordered so the first few execute nearly every line the test runs
+        self.e_cover = data.get("e_cover", [])
         # reads inside lambda bodies: they run when the lambda is called, never at import
         self.lambda_reads = {k: {f: set(ls) for f, ls in v.items()} for k, v in data.get("lambda_reads", {}).items()}
         self.mro = data.get("mro", {})
@@ -762,6 +765,7 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             res.everything = True
             continue
         removed, border = patchlib.changed_old_lines(fd)
+        value_only = patchlib.value_only_change(fd)
         old_lines = old_text.split("\n")
         new_lines = new_text.split("\n")
         for line in sorted(removed | border):
@@ -786,8 +790,22 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 res.notes.append(f"lambda-body {path}:{line}")
                 continue
             in_func = any(isinstance(c, FUNC) for c in chain[1:])
-            if path.startswith("sqlglot/") and (not in_func or line in m.static.get(path, ())):
-                res.import_risk = True
+            if path.startswith("sqlglot/") and not res.import_risk:
+                if in_func:
+                    risky = line in m.static.get(path, ())  # function code run during import
+                elif not value_only:
+                    risky = True  # identifiers changed in import-time code
+                else:
+                    # a value change: only matters at import if import-time code consumes it
+                    classes = [c for c in chain if isinstance(c, ast.ClassDef)]
+                    q = module_name(path) + ":" + ".".join(c.name for c in classes) if classes else None
+                    names = assigned_names(node)
+                    risky = bool(
+                        (q and any(q in m.mro.get(k, (k,)) for k in m.import_classes))
+                        or any(m.static_reads(n, {(path, node.lineno)}) or m.generic_static_read(n) for n in names)
+                        or not names
+                    )
+                res.import_risk = risky
             env_eff0 = None if in_func else env_entry_effect(m, path, node, line, old_lines, new_lines)
             if env_eff0 is not None:
                 # an executor ENV entry: only the tests / TPC-DS queries that call it

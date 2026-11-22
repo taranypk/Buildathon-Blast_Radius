@@ -249,3 +249,32 @@ def added_new_lines(fd: FileDiff) -> set[int]:
             elif item[0] == " ":
                 ln += 1
     return added
+
+
+_VALUE_NAMES = {"True", "False", "None", "and", "or", "not", "is", "in", "if", "else"}
+
+
+def value_only_change(fd: FileDiff) -> bool:
+    """Do the removed and added lines differ only in literals and operators (no identifier
+    added, removed or renamed)? Such a change cannot raise NameError/AttributeError."""
+    import io
+    import tokenize
+    from collections import Counter
+
+    def toks(lines):
+        out = Counter()
+        try:
+            for t in tokenize.generate_tokens(io.StringIO("\n".join(l.strip() for l in lines) + "\n").readline):
+                if t.type == tokenize.NAME and t.string not in _VALUE_NAMES:
+                    out[t.string] += 1
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return None
+        return out
+
+    for h in fd.hunks:
+        rem = [item[1] for item in h[1] if item[0] == "-"]
+        add = [item[1] for item in h[1] if item[0] == "+"]
+        a, b = toks(rem), toks(add)
+        if a is None or b is None or a != b:
+            return False
+    return True

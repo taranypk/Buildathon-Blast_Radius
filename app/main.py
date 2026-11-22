@@ -26,6 +26,7 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 WORKER_MS = 2000
 PSEUDO_BASE = 100000  # map numbers >= this are TPC-DS queries of the executor test
+E_SAMPLE = 10  # TPC-DS queries to run when a change can reach many of them
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))  # our CPU seconds per recorded test second
@@ -300,6 +301,13 @@ def main():
                 keep = pseudo_queries(res, c)
                 if keep is None:
                     keep = m.query_subset(by_num[c], res, c)
+                if (keep is None or len(keep) > E_SAMPLE) and m.e_cover:
+                    # too many (or unknown) queries: run the queries that between them execute
+                    # ~99% of the test's lines, preferring ones the change is known to reach.
+                    # A failure there is caught; scheduling the 21 s test unchecked costs more.
+                    pool = [q for q in m.e_cover if keep is None or q in keep]
+                    rest = [q for q in m.e_cover if q not in pool]
+                    keep = set((pool + rest)[:E_SAMPLE]) | (set(sorted(keep)[:2]) if keep else set())
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
                 if keep is not None and twin_ok and 1.4 + 0.5 * len(keep) > ms[twin[c]] / 1000:
                     keep = None  # the optimizer twin is the cheaper check

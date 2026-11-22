@@ -207,7 +207,13 @@ for t in tests:
             if meth_rng:
                 tranges[str(t["number"])] = [meth_rng, other]
 subq = json.load(open("/home/claude/br/covq/subq_map.json")) if os.path.exists("/home/claude/br/covq/subq_map.json") else {}
+ic_path = os.path.join(covdir, "import_classes.json")
+import_classes = json.load(open(ic_path)) if os.path.exists(ic_path) else []
+cov_order = "/home/claude/br/covq2/cover_order.json"
+e_cover = json.load(open(cov_order)) if os.path.exists(cov_order) else []
 res = {
+    "e_cover": e_cover,
+    "import_classes": import_classes,
     "lambda_reads": {k: {f: sorted(ls) for f, ls in v.items()} for k, v in lambda_reads.items()},
     "env_usage": env_usage,
     "tranges": tranges,
