@@ -16,6 +16,14 @@ import patchlib
 
 FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
 GENERIC = {"self", "cls", "klass", "kls", "mcs", "metacls", "this"}
+# classes whose instances the map-building plugin records (see tools/mapplug.py)
+TRACKED_BASES = {
+    "sqlglot.expressions.core:Expr",
+    "sqlglot.dialects.dialect:Dialect",
+    "sqlglot.parser:Parser",
+    "sqlglot.generator:Generator",
+    "sqlglot.tokens:Tokenizer",
+}
 
 
 def cls_key_file(key):
@@ -48,6 +56,8 @@ class Map:
         self._chain = {}
         self.tests_by_file = {}  # filled by the caller: test file path -> test numbers
         self.always_on_import = set()  # filled by the caller: tests run in a subprocess
+        self.id_of = {}  # filled by the caller: test number -> test id
+        self._ttext = None
         self.by_simple = {}
         for k in self.users:
             self.by_simple.setdefault(k.split(":", 1)[1].split(".")[-1], []).append(k)
@@ -154,6 +164,64 @@ class Map:
                     return None  # covered by the test but not seen per query: be safe
                 keep |= set(ql[str(l)])
         return keep
+
+    def test_texts(self, src_root):
+        """test number -> lower-cased text of its method, its class body and the fixtures it opens."""
+        if self._ttext is not None:
+            return self._ttext
+        opened = {}
+        for p, ts in self.opens.items():
+            for t in ts:
+                if t >= 0:
+                    opened.setdefault(t, []).append(p)
+        fixture_text = {}
+        by_file = {}
+        for n, tid in self.id_of.items():
+            by_file.setdefault(tid.split("::")[0], []).append((n, tid))
+        out = {}
+        for f, items in by_file.items():
+            try:
+                src = open(os.path.join(src_root, f), encoding="utf-8").read()
+                tree = ast.parse(src)
+            except Exception:  # noqa: BLE001
+                for n, _ in items:
+                    out[n] = None
+                continue
+            lines = src.split("\n")
+            classes = {c.name: c for c in tree.body if isinstance(c, ast.ClassDef)}
+            for n, tid in items:
+                _, cname, meth = tid.split("::")
+                c = classes.get(cname)
+                if c is None:
+                    out[n] = None  # inherited or generated test: no filtering
+                    continue
+                parts = []
+                found = False
+                for ch in c.body:
+                    seg = "\n".join(lines[ch.lineno - 1 : ch.end_lineno])
+                    if isinstance(ch, FUNC):
+                        if ch.name == meth:
+                            parts.append(seg)
+                            found = True
+                    else:
+                        parts.append(seg)
+                if not found:
+                    out[n] = None
+                    continue
+                for p in opened.get(n, []):
+                    if p not in fixture_text:
+                        try:
+                            fixture_text[p] = open(os.path.join(src_root, p), encoding="utf-8", errors="replace").read().lower()
+                        except Exception:  # noqa: BLE001
+                            fixture_text[p] = ""
+                    parts.append(fixture_text[p])
+                text = "\n".join(parts).lower()
+                if "dialects" in text or ".classes" in text or "for name in" in text:
+                    out[n] = None  # iterates over every dialect / mapping: keep it
+                else:
+                    out[n] = text
+        self._ttext = out
+        return out
 
     def generic_static_read(self, name):
         """Is `name` read at import time through self/cls (a metaclass deriving other data)?"""
@@ -270,6 +338,35 @@ def _words(text):
     return out
 
 
+def entry_keys(node, line, old_lines, new_lines):
+    """For a changed entry inside a class/module-level dict/list/set literal, the string
+    literals on that line (lower-cased). None when the filter should not apply."""
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+        return None
+    if not isinstance(node.value, (ast.Dict, ast.Set, ast.List, ast.Tuple)):
+        return None
+    if line <= node.lineno:
+        return None  # the assignment line itself
+    import re
+
+    text = old_lines[line - 1] if line - 1 < len(old_lines) else ""
+    lits = [(a or b).strip() for a, b in re.findall(r"\"([^\"\\]*)\"|'([^'\\]*)'", text)]
+    # only SQL keywords / function names: upper-case literals of 3+ characters
+    if not lits or any(len(k) < 3 or k != k.upper() or not re.search(r"[A-Z]", k) for k in lits):
+        return None
+    return {k.lower() for k in lits}
+
+
+def sql_keyed(m, path, chain):
+    """Is this statement in a tokenizer or parser class (whose tables are keyed by SQL text)?"""
+    classes = [c for c in chain if isinstance(c, ast.ClassDef)]
+    if not classes:
+        return False
+    q = module_name(path) + ":" + ".".join(c.name for c in classes)
+    mro = m.mro.get(q, ())
+    return "sqlglot.tokens:Tokenizer" in mro or "sqlglot.parser:Parser" in mro
+
+
 def is_docstring(node):
     return (
         isinstance(node, ast.Expr)
@@ -300,6 +397,8 @@ def class_scope(m, path, chain_classes):
     q = module_name(path) + ":" + ".".join(c.name for c in chain_classes)
     users = m.users.get(q)
     ran = m.tests_in_range(path, cls.lineno, cls.end_lineno or cls.lineno)
+    if users is None and any(b in TRACKED_BASES for b in m.mro.get(q, ())):
+        users = set()  # instances of this family are recorded: none were ever created
     if users is not None:
         return users | ran, q, True
     return ran, q, False
@@ -352,6 +451,10 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
             # the value feeds other import-time code (metaclass, subclass dicts)
             res.notes.append(f"class-attr-derived {q}.{','.join(sorted(names))}")
             out = set(scope) if tracked else set(scope) | readers
+            if any(m.generic_static_read(n) for n in names):
+                # metaclass code copies it onto this class and the class that encloses it
+                # (a dialect's nested Tokenizer feeds the dialect's own settings)
+                out |= _owner_users(m, q)
             for f, l in stat:
                 out |= _static_line(m, src_root, f, l, res, depth, seen, owner=q)
             return out
@@ -384,8 +487,16 @@ def static_effect(m, src_root, path, node, chain, res, depth=0, seen=None):
         res.notes.append(f"module-import {path}")
         return out
     for n in names:
-        files = {f for f in m.reads.get(n, {}) if f == path or imports_name(m, f, n, src_root)}
-        out |= m.readers_in(n, files)
+        for f, ls in m.reads.get(n, {}).items():
+            same_or_imported = f == path or imports_name(m, f, n, src_root)
+            lines = []
+            for l, base in ls:
+                if base == "":
+                    if same_or_imported:
+                        lines.append(l)
+                elif base.split(".")[0] not in GENERIC and not m.match_classes(base):
+                    lines.append(l)  # module.attr (sqlglot.pretty, alias.NAME)
+            out |= m.tests_on(f, lines)
     for n in names:
         for f, l in m.static_reads(n, {(path, node.lineno)}, module=path):
             out |= _static_line(m, src_root, f, l, res, depth, seen)
@@ -524,7 +635,14 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                     # from a class body): follow what it assigns and where it is called
                     res.add(import_time_func_effect(m, src_root, path, node, chain, res))
                 continue
-            res.add(static_effect(m, src_root, path, node, chain, res))
+            eff = static_effect(m, src_root, path, node, chain, res)
+            keys = entry_keys(node, line, old_lines, new_lines) if sql_keyed(m, path, chain) else None
+            if keys and m.id_of:
+                texts = m.test_texts(src_root)
+                kept = {t for t in eff if texts.get(t) is None or any(k in texts[t] for k in keys)}
+                res.notes.append(f"key-filter {sorted(keys)[:3]} {len(eff)}->{len(kept)}")
+                eff = kept
+            res.add(eff)
             # import-time data naming a class (registries such as DIALECTS = ["Tableau", ...]):
             # every test that uses that class, since lookups are cached after first use
             res.add(m.users_named(_words(old_lines[line - 1] if line - 1 < len(old_lines) else "")))
@@ -544,6 +662,11 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 lo, hi = header_range(node)
                 if not (lo <= line <= hi):
                     continue
-                res.add(static_effect(m, src_root, path, node, chain, res, seen={("new", path, node.lineno)}))
+                eff = static_effect(m, src_root, path, node, chain, res, seen={("new", path, node.lineno)})
+                keys = entry_keys(node, line, new_lines, new_lines) if sql_keyed(m, path, chain) else None
+                if keys and m.id_of:
+                    texts = m.test_texts(src_root)
+                    eff = {t for t in eff if texts.get(t) is None or any(k in texts[t] for k in keys)}
+                res.add(eff)
                 res.add(m.users_named(_words(new_lines[line - 1] if line - 1 < len(new_lines) else "")))
     return res

@@ -27,8 +27,8 @@ MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 RUN_LIMIT_S = 4.0     # slower tests are scheduled blind unless they have a proxy
-CPU_FACTOR = 1.3      # our CPU seconds per recorded test second
-P_FAIL = 0.5          # prior that a checked candidate set turns out to fail
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))  # our CPU seconds per recorded test second
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # prior that a checked candidate set turns out to fail
 PROXY_COST = {        # CPU seconds of the cheap stand-ins in runner.PROXIES
     "tests/test_parser.py::TestParser::test_max_nodes": 0.4,
     "tests/test_generator.py::TestGenerator::test_generator_memory": 2.7,
@@ -68,6 +68,43 @@ def pack(nums, ms):
     return best[1]
 
 
+def fixture_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs, on text: [(meta, sql, expected)] or None."""
+    try:
+        lines = [l for l in text.splitlines() if l and not l.startswith("--")]
+        statements = "\n".join(lines).split(";")
+        out = []
+        for i in range(0, len(statements), 2):
+            if i + 1 < len(statements):
+                sql = statements[i].strip()
+                sl = sql.split("\n")
+                j = 0
+                meta = {}
+                while sl[j].startswith("#"):
+                    k, v = sl[j].split(":", maxsplit=1)
+                    meta[k.lstrip("#").strip()] = v.strip()
+                    j += 1
+                out.append((meta, "\n".join(sl[j:]), statements[i + 1].strip()))
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+EXEC_FIXTURES = {
+    # fixture file -> executor test that runs only the query text of each entry
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tests/test_executor.py::TestExecutor::test_execute_tpch",
+}
+
+
+def exec_fixture_queries(path, old_text, new_text):
+    """Indices of entries whose meta or query text changed (None: the file's shape changed)."""
+    a, b = fixture_pairs(old_text or ""), fixture_pairs(new_text or "")
+    if a is None or b is None or len(a) != len(b):
+        return None
+    return {i for i, (x, y) in enumerate(zip(a, b)) if x[0] != y[0] or x[1] != y[1]}
+
+
 def pack_cost(nums, ms):
     w = pack(nums, ms)
     if not w:
@@ -98,6 +135,7 @@ def main():
         m = analyze.Map(json.load(f))
     for t in tests:
         m.tests_by_file.setdefault(t["file"], set()).add(t["number"])
+        m.id_of[t["number"]] = t["id"]
         if t["id"].endswith("::test_lazy_load"):
             m.always_on_import.add(t["number"])
     cdir = os.path.join(DATA, "commits")
@@ -157,7 +195,30 @@ def main():
             continue
         p = Plan(cid, cands, files)
         run = set()
+        # edits to the TPC-H/TPC-DS query files: the executor tests only run the query text
+        only_fixture_reason = {}
+        if files and all(f in EXEC_FIXTURES for f in files):
+            for fpath, tid in EXEC_FIXTURES.items():
+                if fpath not in files and tid in by_id:
+                    # the other benchmark's executor test never reads this file
+                    cands.discard(by_id[tid])
+                    p.cands.discard(by_id[tid])
+        for fpath, tid in EXEC_FIXTURES.items():
+            if fpath in files and tid in by_id and by_id[tid] in cands:
+                old_f = open(os.path.join(SRC, fpath), encoding="utf-8").read() if os.path.exists(os.path.join(SRC, fpath)) else None
+                changed = exec_fixture_queries(fpath, old_f, files[fpath])
+                other_files = [f for f in files if f != fpath]
+                if changed is not None and not other_files:
+                    if not changed:
+                        cands.discard(by_id[tid])
+                        p.cands.discard(by_id[tid])
+                    elif tid in m.subq:
+                        p.keep[tid] = sorted(changed)
+                        only_fixture_reason[by_id[tid]] = True
         for c in list(cands):
+            if c in only_fixture_reason:
+                run.add(c)
+                continue
             if c in subq_tests and res is not None and c not in run:
                 keep = m.query_subset(by_num[c], res, c)
                 twin_ok = c in twin and all(twin[c] in r for r in res.reasons if c in r)
@@ -208,7 +269,7 @@ def main():
             out[p.cid] = pack(p.cands, ms)
             log(p.cid, "blind (budget)")
             continue
-        timeout = max(10.0, p.est * 3 + 8)
+        timeout = max(20.0, p.est * 5 + 10)
         specs.append((p.cid, p.files, [by_num[c] for c in p.run], timeout, p.keep))
 
     def final_set(p, failed, passed, done, broken=()):
