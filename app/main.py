@@ -110,13 +110,27 @@ def fixture_lines(text):
     return out
 
 
-def fixture_case_changes(old_text, new_text):
+# fixture files the tests read line by line (load_sql_fixtures); every other fixture is
+# only read as (sql; expected;) pairs
+LINE_FIXTURES = {
+    "tests/fixtures/identity.sql",
+    "tests/fixtures/partial.sql",
+    "tests/fixtures/optimizer/qualify_columns__invalid.sql",
+}
+
+
+def fixture_case_changes(old_text, new_text, path=None):
     """Indices of fixture cases that differ (under either loader), or None if unsure."""
     a, b = fixture_pairs(old_text or ""), fixture_pairs(new_text or "")
-    c, d = fixture_lines(old_text or ""), fixture_lines(new_text or "")
-    if a is None or b is None or len(a) != len(b) or len(c) != len(d):
+    if a is None or b is None or len(a) != len(b):
         return None
-    return {i for i, (x, y) in enumerate(zip(a, b)) if x != y} | {i for i, (x, y) in enumerate(zip(c, d)) if x != y}
+    out = {i for i, (x, y) in enumerate(zip(a, b)) if x != y}
+    if path is None or path in LINE_FIXTURES:
+        c, d = fixture_lines(old_text or ""), fixture_lines(new_text or "")
+        if len(c) != len(d):
+            return None
+        out |= {i for i, (x, y) in enumerate(zip(c, d)) if x != y}
+    return out
 
 
 def exec_fixture_queries(path, old_text, new_text):
@@ -267,6 +281,41 @@ def main():
         run = set()
         # edits to the TPC-H/TPC-DS query files: the executor tests only run the query text
         only_fixture_reason = {}
+        if files and all(f.startswith("tests/fixtures/") and f.endswith(".sql") for f in files):
+            # TestExecutor.setUpClass loads the TPC-H/TPC-DS query files for every test of
+            # the class, but only these tests read them; while the files still load the same
+            # number of entries, setUpClass is unaffected for the rest of the class
+            readers = {
+                "tests/test_executor.py::TestExecutor::test_execute_tpch",
+                "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+                "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+            }
+            loads_ok = True
+            for fpath in files:
+                if fpath in EXEC_FIXTURES:
+                    old_p = os.path.join(SRC, fpath)
+                    a = fixture_pairs(open(old_p, encoding="utf-8").read()) if os.path.exists(old_p) else None
+                    b = fixture_pairs(files[fpath]) if files[fpath] is not None else None
+                    loads_ok = loads_ok and a is not None and b is not None and len(a) == len(b)
+            unchanged = True
+            for fpath in files:
+                old_p = os.path.join(SRC, fpath)
+                if files[fpath] is None or not os.path.exists(old_p):
+                    unchanged = False
+                    continue
+                ch = fixture_case_changes(open(old_p, encoding="utf-8").read(), files[fpath], fpath)
+                unchanged = unchanged and ch is not None and not ch
+            if unchanged:
+                # comments, blank lines or whitespace the loaders strip: no test sees a change
+                log(cid, "fixture cases unchanged")
+                cands.clear()
+                p.cands.clear()
+            if loads_ok:
+                for c in list(cands):
+                    i = by_num[c]
+                    if i.startswith("tests/test_executor.py::TestExecutor::") and i not in readers:
+                        cands.discard(c)
+                        p.cands.discard(c)
         if files and all(f in EXEC_FIXTURES for f in files):
             for fpath, tid in EXEC_FIXTURES.items():
                 if fpath not in files and tid in by_id:
@@ -290,7 +339,7 @@ def main():
             if fpath.startswith("tests/fixtures/") and fpath.endswith(".sql"):
                 old_f = os.path.join(SRC, fpath)
                 old_t = open(old_f, encoding="utf-8").read() if os.path.exists(old_f) else None
-                fixture_changes[fpath] = fixture_case_changes(old_t, ftext) if old_t is not None and ftext is not None else None
+                fixture_changes[fpath] = fixture_case_changes(old_t, ftext, fpath) if old_t is not None and ftext is not None else None
         for c in list(cands):
             if c in only_fixture_reason:
                 run.add(c)
