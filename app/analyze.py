@@ -248,13 +248,24 @@ class Map:
                     out |= self.users[k]
         return out
 
-    def key_filter(self, src_root, tests, keys):
+    def key_filter(self, src_root, tests, keys, word=False):
+        if word:
+            import re
+
+            rx = re.compile("|".join(r"(?<![a-z0-9_])" + re.escape(k) + r"(?![a-z0-9_])" for k in keys))
+
+            def has(text):
+                return rx.search(text) is not None
+        else:
+            def has(text):
+                return any(k in text for k in keys)
+
         out = set()
         hit = {}
         for t in tests:
             if t >= 100000:
                 q = self.pseudo_text(src_root, t - 100000)
-                if q is None or any(k in q for k in keys):
+                if q is None or has(q):
                     out.add(t)
                 continue
             tt = self.test_text(src_root, t)
@@ -262,13 +273,12 @@ class Map:
                 out.add(t)
                 continue
             text, fixtures = tt
-            if any(k in text for k in keys):
+            if has(text):
                 out.add(t)
                 continue
             for p in fixtures:
                 if p not in hit:
-                    ft = self._fixture(src_root, p)
-                    hit[p] = any(k in ft for k in keys)
+                    hit[p] = has(self._fixture(src_root, p))
                 if hit[p]:
                     out.add(t)
                     break
@@ -475,6 +485,62 @@ def escape_keys(node, line, old_lines, new_lines):
         else:
             out.add(("\\" + k).lower())
     return out
+
+_GLOBAL_TEST_TEXT = {}
+
+
+def global_test_text(src_root):
+    """Lower-cased test code outside test classes (module-level constants, helpers) that the
+    per-test text does not include."""
+    if "t" in _GLOBAL_TEST_TEXT:
+        return _GLOBAL_TEST_TEXT["t"]
+    import glob
+
+    parts = []
+    for f in glob.glob(os.path.join(src_root, "tests", "**", "*.py"), recursive=True):
+        try:
+            text = open(f, encoding="utf-8").read()
+            tree = ast.parse(text)
+        except Exception:  # noqa: BLE001
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                continue
+            # only string literals: SQL text and schema names, not Python identifiers
+            docs = {id(x.value) for x in ast.walk(node) if isinstance(x, ast.Expr)}
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and id(sub) not in docs:
+                    parts.append(sub.value)
+    _GLOBAL_TEST_TEXT["t"] = "\n".join(parts).lower()
+    return _GLOBAL_TEST_TEXT["t"]
+
+
+def reserved_keys(m, src_root, path, chain, node, line, lines_):
+    """An entry of a generator's RESERVED_KEYWORDS set: only identifiers spelled like the
+    old or new entry are quoted differently. Returns those words, or None."""
+    import re
+
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)) or line <= node.lineno:
+        return None
+    tgt = node.targets[0] if isinstance(node, ast.Assign) else node.target
+    if not isinstance(tgt, ast.Name) or tgt.id != "RESERVED_KEYWORDS":
+        return None
+    if not isinstance(node.value, (ast.Set, ast.List, ast.Tuple)):
+        return None
+    classes = [c for c in chain if isinstance(c, ast.ClassDef)]
+    if not classes:
+        return None
+    q = module_name(path) + ":" + ".".join(c.name for c in classes)
+    if "sqlglot.generator:Generator" not in m.mro.get(q, ()):
+        return None
+    text = lines_[line - 1] if line - 1 < len(lines_) else ""
+    if not re.fullmatch(r"\s*(\"[A-Za-z0-9_]+\",\s*)+", text):
+        return None
+    words = {w.lower() for w in re.findall(r"\"([A-Za-z0-9_]+)\"", text)}
+    g = global_test_text(src_root)
+    if not words or any(re.search(r"(?<![a-z0-9_])" + re.escape(w) + r"(?![a-z0-9_])", g) for w in words):
+        return None
+    return words
 
 
 def sql_keyed(m, path, chain):
@@ -886,8 +952,14 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
             keys = entry_keys(node, line, old_lines, new_lines) if sql_keyed(m, path, chain) else None
             if keys is None and sql_keyed(m, path, chain):
                 keys = escape_keys(node, line, old_lines, new_lines)
+            word = False
+            if keys is None:
+                k_old = reserved_keys(m, src_root, path, chain, node, line, old_lines)
+                k_new = reserved_keys(m, src_root, path, chain, node, line, new_lines)
+                keys = (k_old | k_new) if k_old is not None and k_new is not None else None
+                word = True
             if keys and m.id_of:
-                kept = m.key_filter(src_root, eff, keys)
+                kept = m.key_filter(src_root, eff, keys, word=word)
                 res.notes.append(f"key-filter {sorted(keys)[:3]} {len(eff)}->{len(kept)}")
                 eff = kept
             res.add(eff)
@@ -921,8 +993,12 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
                 keys = entry_keys(node, line, new_lines, new_lines) if sql_keyed(m, path, chain) else None
                 if keys is None and sql_keyed(m, path, chain):
                     keys = escape_keys(node, line, old_lines, new_lines)
+                word = False
+                if keys is None:
+                    keys = reserved_keys(m, src_root, path, chain, node, line, new_lines)
+                    word = True
                 if keys and m.id_of:
-                    eff = m.key_filter(src_root, eff, keys)
+                    eff = m.key_filter(src_root, eff, keys, word=word)
                 res.add(eff)
                 res.add(m.users_named(_words(new_lines[line - 1] if line - 1 < len(new_lines) else "")))
     return res
