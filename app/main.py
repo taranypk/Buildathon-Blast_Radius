@@ -377,7 +377,10 @@ def main():
             w = pack(plans[cid].cands, ms) if cid in plans else []
         print(json.dumps({"commit": cid, "workers": w}))
     sys.stdout.flush()
-    log(f"total {time.monotonic()-t0:.1f}s")
+    import resource
+
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    log(f"total {time.monotonic()-t0:.1f}s main-cpu {r.ru_utime + r.ru_stime:.1f}s")
 
 
 if __name__ == "__main__":

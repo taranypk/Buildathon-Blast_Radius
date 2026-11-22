@@ -153,11 +153,45 @@ def changed_old_lines(fd: FileDiff) -> tuple[set[int], set[int]]:
     return removed, border
 
 
-def same_ast(a: str, b: str) -> bool | None:
+def _tokens(text):
+    import io
+    import tokenize
+
+    out = []
     try:
-        return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
-    except SyntaxError:
+        for t in tokenize.generate_tokens(io.StringIO(text).readline):
+            if t.type in (tokenize.COMMENT, tokenize.NL):
+                continue
+            if t.type == tokenize.NEWLINE:
+                out.append((t.type, ""))
+            else:
+                out.append((t.type, t.string))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
         return None
+    return out
+
+
+def _middle(a, b):
+    """Strip the common prefix and suffix of two token lists."""
+    i = 0
+    n = min(len(a), len(b))
+    while i < n and a[i] == b[i]:
+        i += 1
+    j = 0
+    while j < n - i and a[len(a) - 1 - j] == b[len(b) - 1 - j]:
+        j += 1
+    return a[i : len(a) - j], b[i : len(b) - j], a[max(0, i - 1) : i] + a[len(a) - j : len(a) - j + 1]
+
+
+def same_ast(a: str, b: str) -> bool | None:
+    """Same code apart from comments and blank lines (token streams equal)."""
+    ta, tb = _tokens(a), _tokens(b)
+    if ta is None or tb is None:
+        try:
+            return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
+        except SyntaxError:
+            return None
+    return ta == tb
 
 
 class _NoneCompare(ast.NodeTransformer):
@@ -178,6 +212,16 @@ class _NoneCompare(ast.NodeTransformer):
 
 
 def same_ast_modulo_none_compare(a: str, b: str) -> bool:
+    ta, tb = _tokens(a), _tokens(b)
+    if ta is not None and tb is not None:
+        ma, mb, around = _middle(ta, tb)
+        sa, sb = [t[1] for t in ma], [t[1] for t in mb]
+        pairs = {(("is",), ("==",)), (("==",), ("is",)), (("is", "not"), ("!=",)), (("!=",), ("is", "not"))}
+        if (tuple(sa), tuple(sb)) in pairs:
+            # the operator sits right next to the differing span: is a None on either side?
+            return any(t[1] == "None" for t in around)
+        if len(ma) + len(mb) < 40:
+            return False  # a small, different change
     try:
         ta, tb = _NoneCompare().visit(ast.parse(a)), _NoneCompare().visit(ast.parse(b))
         return ast.dump(ta) == ast.dump(tb)

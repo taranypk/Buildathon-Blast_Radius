@@ -647,11 +647,13 @@ def analyze(patch_text, src_root, m: Map, n_tests=None) -> Result:
         if new_text is not None and patchlib.same_ast_modulo_none_compare(old_text, new_text):
             res.notes.append(f"none-compare-only {path}")
             continue
-        try:
-            tree = ast.parse(old_text)
-        except SyntaxError:
-            res.everything = True
-            continue
+        tree = m.tree(src_root, fd.old) if fd.old == path else None
+        if tree is None:
+            try:
+                tree = ast.parse(old_text)
+            except SyntaxError:
+                res.everything = True
+                continue
         if new_text is None:
             res.notes.append(f"deleted {path}")
             res.everything = True
