@@ -211,6 +211,7 @@ def main():
         return 0.15 + setup + CPU_FACTOR * sum(eff(n, p) for n in nums)
 
     out = {}
+    unchecked_e = set()  # PROBE
     plans: dict[str, Plan] = {}
     for name in patches:
         cid = name[:-6]
@@ -334,6 +335,9 @@ def main():
         cost_check = (1 - P_FAIL) * lo + P_FAIL * hi
         p.import_check = bool(res is not None and res.import_risk)
         if not run or cost_blind <= cost_check:
+            e_num_ = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+            if e_num_ in cands:
+                unchecked_e.add(cid)
             out[cid] = pack(cands, ms)
             log(cid, f"blind cands={len(cands)} blind_cost={cost_blind:.1f} check_cost={cost_check:.1f}")
             if p.import_check:
@@ -404,6 +408,9 @@ def main():
         failed, passed, done, broken = result
         p = plans[cid]
         final = final_set(p, failed, passed, done, broken)
+        e_num_ = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+        if e_num_ in p.blind and e_num_ not in p.decided_by:
+            final.discard(e_num_)  # PROBE: drop TPC-DS scheduled without any check
         out[cid] = pack(final, ms)
         log(cid, f"run={len(p.run)} est={p.est:.2f}s blind={len(p.blind)} failed={len(failed)} "
                  f"final={len(final)} done={done} t={time.monotonic()-t0:.1f}")
@@ -412,6 +419,10 @@ def main():
         runner.warm_imports()
         runner.run_jobs(specs, SRC, TMP, parallel=2, on_done=finish, should_stop=should_stop)
 
+    e_probe = by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    for cid_ in unchecked_e:
+        if cid_ in out and cid_ not in plans:
+            out[cid_] = pack({n for g in out[cid_] for n in g} - {e_probe}, ms)
     for name in patches:
         cid = name[:-6]
         w = out.get(cid)
